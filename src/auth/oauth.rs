@@ -16,6 +16,7 @@ pub struct OAuthDevice {
     store: TokenStore,
     http: reqwest::Client,
     base: String,
+    open_browser: bool,
 }
 
 impl OAuthDevice {
@@ -29,7 +30,15 @@ impl OAuthDevice {
             store,
             http: reqwest::Client::new(),
             base: base.to_string(),
+            open_browser: true,
         }
+    }
+
+    /// Disable opening the browser during the flow (used in tests).
+    #[cfg(test)]
+    fn without_browser(mut self) -> Self {
+        self.open_browser = false;
+        self
     }
 
     async fn run_flow(&self) -> Result<String, AuthError> {
@@ -50,7 +59,9 @@ impl OAuthDevice {
             "to authorize github-notifications, visit {verification} and enter code {}",
             device.user_code
         );
-        open_browser(&verification);
+        if self.open_browser {
+            open_browser(&verification);
+        }
 
         // 2. Poll until the user authorizes (or the code expires).
         let mut interval = device.interval.max(1);
@@ -200,7 +211,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = TokenStore::new(dir.path().join("auth.toml"));
 
-        let provider = OAuthDevice::with_base("client-123".into(), store, &base);
+        let provider = OAuthDevice::with_base("client-123".into(), store, &base).without_browser();
         let token = provider.token().await.expect("token");
         assert_eq!(token, "tok-42");
 

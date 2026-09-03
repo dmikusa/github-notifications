@@ -18,15 +18,3 @@ pub fn open_browser(url: &str) {
         tracing::warn!("could not open browser: {e}");
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn open_browser_does_not_panic() {
-        // Just ensure the function is callable without panicking; the actual
-        // browser spawn is best-effort.
-        open_browser("http://127.0.0.1:8080");
-    }
-}

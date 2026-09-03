@@ -95,12 +95,14 @@ async fn main() -> Result<()> {
 /// Determine the listen address: explicit `--bind`, then `$PORT` (container),
 /// then the localhost default.
 fn resolve_bind(cli_bind: Option<SocketAddr>) -> SocketAddr {
+    resolve_bind_with_port(cli_bind, std::env::var("PORT").ok())
+}
+
+fn resolve_bind_with_port(cli_bind: Option<SocketAddr>, port: Option<String>) -> SocketAddr {
     if let Some(addr) = cli_bind {
         return addr;
     }
-    if let Ok(port) = std::env::var("PORT")
-        .and_then(|p| p.parse::<u16>().map_err(|_| std::env::VarError::NotPresent))
-    {
+    if let Some(port) = port.and_then(|p| p.parse::<u16>().ok()) {
         return SocketAddr::from(([0, 0, 0, 0], port));
     }
     SocketAddr::from(([127, 0, 0, 1], 8080))
@@ -113,19 +115,25 @@ mod tests {
     #[test]
     fn bind_prefers_explicit() {
         let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
-        assert_eq!(resolve_bind(Some(addr)), addr);
+        assert_eq!(
+            resolve_bind_with_port(Some(addr), Some("9090".into())),
+            addr
+        );
     }
 
     #[test]
-    fn bind_uses_port_env() {
-        std::env::set_var("PORT", "9090");
-        assert_eq!(resolve_bind(None), SocketAddr::from(([0, 0, 0, 0], 9090)));
-        std::env::remove_var("PORT");
+    fn bind_uses_port() {
+        assert_eq!(
+            resolve_bind_with_port(None, Some("9090".into())),
+            SocketAddr::from(([0, 0, 0, 0], 9090))
+        );
     }
 
     #[test]
     fn bind_defaults_to_localhost() {
-        std::env::remove_var("PORT");
-        assert_eq!(resolve_bind(None), SocketAddr::from(([127, 0, 0, 1], 8080)));
+        assert_eq!(
+            resolve_bind_with_port(None, None),
+            SocketAddr::from(([127, 0, 0, 1], 8080))
+        );
     }
 }
