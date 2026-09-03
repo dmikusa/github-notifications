@@ -272,3 +272,12 @@ with the human before proceeding.
 5. After completing a phase, present a review to the human before proceeding.
 6. Before every commit and push, run `cargo fmt` then
    `cargo clippy -- -D warnings` and ensure both pass clean.
+
+## Status
+
+- [x] Phase 0 — Scaffold & repo infrastructure
+- [x] Phase 1 — Auth
+- [ ] Phase 2 — Sync engine
+- [ ] Phase 3 — UI
+- [ ] Phase 4 — Extras
+- [ ] Phase 5 — Distribution

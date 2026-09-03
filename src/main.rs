@@ -1,10 +1,10 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use github_notifications::{api, config, db};
+use github_notifications::{api, auth, config, db, github, util};
 
 #[derive(Parser)]
 #[command(
@@ -39,19 +39,50 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let config = config::Config::load(cli.config.as_deref())?;
-    let db = db::Database::open(&db::default_data_dir().join("data.db"))
-        .context("opening local database")?;
+
+    let data_dir = db::default_data_dir();
+    let db = db::Database::open(&data_dir.join("data.db")).context("opening local database")?;
+
+    let token_store = auth::TokenStore::new(data_dir.join("auth.toml"));
+    let token = auth::from_config(&config, token_store);
+    let client = github::Client::new(token.clone());
+
+    let validation = Arc::new(Mutex::new(None::<github::Validation>));
+    if config.github.auth_provider != config::AuthProvider::OAuthDevice {
+        match client.validate().await {
+            Ok(v) => {
+                if v.ok {
+                    tracing::info!(
+                        "authenticated as {}",
+                        v.login.as_deref().unwrap_or("unknown")
+                    );
+                } else {
+                    tracing::warn!(
+                        "auth incomplete: {}",
+                        v.message.as_deref().unwrap_or("unknown reason")
+                    );
+                }
+                *validation.lock().expect("validation lock poisoned") = Some(v);
+            }
+            Err(e) => tracing::warn!("could not validate credentials: {e}"),
+        }
+    } else {
+        tracing::info!("oauth-device auth configured; authorize from the web UI");
+    }
 
     let addr = resolve_bind(cli.bind);
     tracing::info!("github-notifications listening on http://{addr}");
 
     if cli.open {
-        open_browser(&format!("http://{addr}"));
+        util::open_browser(&format!("http://{addr}"));
     }
 
     let app = api::router(api::AppState {
         config: Arc::new(config),
         db: Arc::new(db),
+        token,
+        github: client,
+        validation,
     });
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -73,29 +104,6 @@ fn resolve_bind(cli_bind: Option<SocketAddr>) -> SocketAddr {
         return SocketAddr::from(([0, 0, 0, 0], port));
     }
     SocketAddr::from(([127, 0, 0, 1], 8080))
-}
-
-/// Best-effort open of a URL in the platform default browser.
-#[cfg(not(target_os = "windows"))]
-fn open_browser(url: &str) {
-    let command = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    if let Err(e) = std::process::Command::new(command).arg(url).spawn() {
-        tracing::warn!("could not open browser: {e}");
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn open_browser(url: &str) {
-    if let Err(e) = std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
-        .spawn()
-    {
-        tracing::warn!("could not open browser: {e}");
-    }
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::{
     extract::State,
@@ -11,8 +11,10 @@ use serde::Serialize;
 
 use crate::{
     assets::{app_js, Assets},
+    auth::TokenProvider,
     config::{AuthProvider, Config, Workspace},
     db::Database,
+    github::{self, Validation},
 };
 
 /// Shared application state handed to every handler.
@@ -20,6 +22,11 @@ use crate::{
 pub struct AppState {
     pub config: Arc<Config>,
     pub db: Arc<Database>,
+    pub token: Arc<dyn TokenProvider>,
+    pub github: github::Client,
+    /// Cached credential validation, filled at startup (non-OAuth) or on the
+    /// first `/api/state` call.
+    pub validation: Arc<Mutex<Option<Validation>>>,
 }
 
 /// Build the axum router for the local HTTP server.
@@ -57,6 +64,10 @@ struct StateResponse {
 struct AuthState {
     provider: String,
     authenticated: bool,
+    login: Option<String>,
+    scopes: Vec<String>,
+    missing: Vec<String>,
+    ok: bool,
 }
 
 #[derive(Serialize)]
@@ -69,13 +80,46 @@ async fn state_handler(State(state): State<AppState>) -> Response {
     let config = state.config.as_ref();
     let last_sync = state.db.get_sync_state("last_sync").unwrap_or_default();
 
+    // Resolving the token may run the OAuth device flow on first use.
+    let authenticated = state.token.token().await.is_ok();
+
+    let validation = {
+        let needs_validate = state
+            .validation
+            .lock()
+            .expect("validation lock poisoned")
+            .is_none();
+        if needs_validate {
+            if let Ok(v) = state.github.validate().await {
+                *state.validation.lock().expect("validation lock poisoned") = Some(v);
+            }
+        }
+        state
+            .validation
+            .lock()
+            .expect("validation lock poisoned")
+            .clone()
+    };
+
+    let auth = AuthState {
+        provider: provider_name(config.github.auth_provider).to_string(),
+        authenticated,
+        login: validation.as_ref().and_then(|v| v.login.clone()),
+        scopes: validation
+            .as_ref()
+            .map(|v| v.scopes.clone())
+            .unwrap_or_default(),
+        missing: validation
+            .as_ref()
+            .map(|v| v.missing.clone())
+            .unwrap_or_default(),
+        ok: validation.as_ref().map(|v| v.ok).unwrap_or(false),
+    };
+
     let response = StateResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         workspaces: config.workspaces.clone(),
-        auth: AuthState {
-            provider: provider_name(config.github.auth_provider),
-            authenticated: is_authenticated(config),
-        },
+        auth,
         sync: SyncState {
             last_sync,
             running: false,
@@ -89,22 +133,11 @@ async fn state_handler(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-fn provider_name(provider: AuthProvider) -> String {
+fn provider_name(provider: AuthProvider) -> &'static str {
     match provider {
         AuthProvider::Pat => "pat",
         AuthProvider::GhToken => "gh-token",
         AuthProvider::OAuthDevice => "oauth-device",
-    }
-    .to_string()
-}
-
-/// Phase 0 heuristic for whether a credential is available. Phase 1 replaces
-/// this with real validation (token scopes / live calls).
-fn is_authenticated(config: &Config) -> bool {
-    match config.github.auth_provider {
-        AuthProvider::Pat => !config.effective_token().is_empty(),
-        AuthProvider::GhToken => true,
-        AuthProvider::OAuthDevice => false,
     }
 }
 
@@ -130,6 +163,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::auth::pat::ClassicPat;
     use crate::config::GithubConfig;
 
     fn test_state() -> AppState {
@@ -147,9 +181,20 @@ mod tests {
             }],
         };
         let db = Database::open(&dir.path().join("data.db")).expect("open db");
+        let token: Arc<dyn TokenProvider> = Arc::new(ClassicPat::new("ghp_test".into()));
         AppState {
             config: Arc::new(config),
             db: Arc::new(db),
+            github: github::Client::new(token.clone()),
+            token,
+            validation: Arc::new(Mutex::new(Some(Validation {
+                login: Some("octocat".into()),
+                scopes: vec!["notifications".into(), "repo".into()],
+                missing: Vec::new(),
+                sso_hint: None,
+                ok: true,
+                message: None,
+            }))),
         }
     }
 
@@ -183,6 +228,8 @@ mod tests {
         assert_eq!(value["workspaces"][0]["name"], "personal");
         assert_eq!(value["auth"]["provider"], "pat");
         assert_eq!(value["auth"]["authenticated"], true);
+        assert_eq!(value["auth"]["login"], "octocat");
+        assert_eq!(value["auth"]["ok"], true);
     }
 
     #[tokio::test]
