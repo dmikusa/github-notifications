@@ -64,9 +64,9 @@ impl TokenProvider for GhToken {
 mod tests {
     use super::*;
 
-    fn gh_available() -> bool {
+    fn gh_logged_in() -> bool {
         std::process::Command::new("gh")
-            .arg("--version")
+            .args(["auth", "status"])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
@@ -74,8 +74,10 @@ mod tests {
 
     #[tokio::test]
     async fn resolves_token_when_gh_present() {
-        if !gh_available() {
-            eprintln!("skipping: gh not installed");
+        // CI runners ship gh but are not logged in; only run this when a real
+        // session exists so the test stays deterministic in CI.
+        if !gh_logged_in() {
+            eprintln!("skipping: gh not logged in");
             return;
         }
         let provider = GhToken::new();
