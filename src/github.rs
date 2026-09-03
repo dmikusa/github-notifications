@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use axum::http::StatusCode;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, USER_AGENT};
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, IF_NONE_MATCH, LINK, USER_AGENT};
+use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -40,7 +41,7 @@ impl Client {
         Self::with_base(token, DEFAULT_BASE)
     }
 
-    fn with_base(token: Arc<dyn TokenProvider>, base: &str) -> Self {
+    pub(crate) fn with_base(token: Arc<dyn TokenProvider>, base: &str) -> Self {
         let mut headers = HeaderMap::new();
         headers.insert(
             ACCEPT,
@@ -69,25 +70,38 @@ impl Client {
         }
     }
 
-    /// Perform an authenticated `GET`, returning status, headers, and body
+    /// Perform an authenticated request, returning status, headers, and body
     /// bytes. On a 401 the token provider is refreshed once and the request
-    /// retried.
-    async fn get(
+    /// retried. An optional ETag is sent as `If-None-Match` for conditional
+    /// requests (a 304 is returned untouched to the caller).
+    async fn request(
         &self,
-        path: &str,
+        method: &str,
+        url: &str,
         params: &[(&str, &str)],
-    ) -> Result<(StatusCode, HeaderMap, Vec<u8>), ClientError> {
+        etag: Option<&str>,
+    ) -> Result<GitResponse, ClientError> {
         let mut attempt = 0;
         loop {
             let token = self.token.token().await?;
-            let mut request = self
-                .http
-                .get(format!("{}{}", self.base, path))
-                .bearer_auth(&token);
+            let mut builder = match method {
+                "GET" => self.http.get(url),
+                "PATCH" => self.http.patch(url),
+                _ => {
+                    return Err(ClientError::Github(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("unsupported method {method}"),
+                    ))
+                }
+            };
+            builder = builder.bearer_auth(&token);
             if !params.is_empty() {
-                request = request.query(params);
+                builder = builder.query(params);
             }
-            let response = request.send().await?;
+            if let Some(e) = etag {
+                builder = builder.header(IF_NONE_MATCH, e);
+            }
+            let response = builder.send().await?;
             let status = response.status();
             let headers = response.headers().clone();
             let body = response.bytes().await?.to_vec();
@@ -97,15 +111,46 @@ impl Client {
                 attempt += 1;
                 continue;
             }
-            return Ok((status, headers, body));
+            return Ok(GitResponse {
+                status,
+                headers,
+                body,
+            });
         }
+    }
+
+    /// Authenticated `GET` to a path under the API base URL.
+    pub async fn get(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+        etag: Option<&str>,
+    ) -> Result<GitResponse, ClientError> {
+        self.request("GET", &format!("{}{}", self.base, path), params, etag)
+            .await
+    }
+
+    /// Authenticated `GET` to an absolute URL (e.g. a `Link` page or a subject
+    /// URL from a notification thread).
+    pub async fn get_url(&self, url: &str, etag: Option<&str>) -> Result<GitResponse, ClientError> {
+        self.request("GET", url, &[], etag).await
+    }
+
+    /// Authenticated `PATCH` to a path under the API base URL (e.g. marking a
+    /// thread read).
+    pub async fn patch(&self, path: &str) -> Result<GitResponse, ClientError> {
+        self.request("PATCH", &format!("{}{}", self.base, path), &[], None)
+            .await
     }
 
     /// Validate the current credential against `GET /user`, returning login,
     /// granted scopes (from `X-OAuth-Scopes`), and any missing requirements or
     /// SAML SSO hints.
     pub async fn validate(&self) -> Result<Validation, ClientError> {
-        let (status, headers, body) = self.get("/user", &[]).await?;
+        let response = self.get("/user", &[], None).await?;
+        let status = response.status;
+        let headers = response.headers;
+        let body = response.body;
 
         let scopes = parse_scopes(headers.get("x-oauth-scopes"));
         let sso_hint = headers
@@ -163,6 +208,50 @@ impl Client {
             }),
         }
     }
+}
+
+/// A raw GitHub API response.
+pub struct GitResponse {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    pub body: Vec<u8>,
+}
+
+/// Rate limit state surfaced from `X-RateLimit-*` response headers.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RateLimit {
+    pub limit: Option<u64>,
+    pub remaining: Option<u64>,
+    pub reset: Option<u64>,
+}
+
+pub fn rate_limit_from(headers: &HeaderMap) -> RateLimit {
+    fn parse(headers: &HeaderMap, name: &str) -> Option<u64> {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+    }
+    RateLimit {
+        limit: parse(headers, "x-ratelimit-limit"),
+        remaining: parse(headers, "x-ratelimit-remaining"),
+        reset: parse(headers, "x-ratelimit-reset"),
+    }
+}
+
+/// Extract the URL of the next page from a `Link` header, if present.
+pub fn next_link(headers: &HeaderMap) -> Option<String> {
+    let link = headers.get(LINK)?.to_str().ok()?;
+    link.split(',')
+        .find(|part| part.contains("rel=\"next\""))?
+        .split(';')
+        .next()
+        .map(|url| url.trim().trim_matches('<').trim_matches('>').to_string())
+}
+
+/// Whether a `Link` header advertises a next page.
+pub fn has_next(headers: &HeaderMap) -> bool {
+    next_link(headers).is_some()
 }
 
 /// Parse the comma-separated `X-OAuth-Scopes` header into a list.

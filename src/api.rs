@@ -4,17 +4,19 @@ use axum::{
     extract::State,
     http::{header, StatusCode, Uri},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use serde::Serialize;
+use tokio::sync::mpsc;
 
 use crate::{
     assets::{app_js, Assets},
     auth::TokenProvider,
     config::{AuthProvider, Config, Workspace},
     db::Database,
-    github::{self, Validation},
+    github::{self, RateLimit, Validation},
+    sync::SyncStatus,
 };
 
 /// Shared application state handed to every handler.
@@ -27,6 +29,8 @@ pub struct AppState {
     /// Cached credential validation, filled at startup (non-OAuth) or on the
     /// first `/api/state` call.
     pub validation: Arc<Mutex<Option<Validation>>>,
+    pub sync_status: Arc<Mutex<SyncStatus>>,
+    pub sync_trigger: mpsc::Sender<()>,
 }
 
 /// Build the axum router for the local HTTP server.
@@ -35,6 +39,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(root))
         .route("/app.js", get(app_js_handler))
         .route("/api/state", get(state_handler))
+        .route("/api/sync", post(sync_handler))
         .fallback(static_handler)
         .with_state(state)
 }
@@ -72,13 +77,15 @@ struct AuthState {
 
 #[derive(Serialize)]
 struct SyncState {
-    last_sync: Option<String>,
     running: bool,
+    last_sync: Option<String>,
+    last_error: Option<String>,
+    rate_limit: Option<RateLimit>,
 }
 
 async fn state_handler(State(state): State<AppState>) -> Response {
     let config = state.config.as_ref();
-    let last_sync = state.db.get_sync_state("last_sync").unwrap_or_default();
+    let last_sync_db = state.db.get_sync_state("last_sync").unwrap_or_default();
 
     // Resolving the token may run the OAuth device flow on first use.
     let authenticated = state.token.token().await.is_ok();
@@ -101,6 +108,16 @@ async fn state_handler(State(state): State<AppState>) -> Response {
             .clone()
     };
 
+    let sync = {
+        let s = state.sync_status.lock().expect("sync status poisoned");
+        SyncState {
+            running: s.running,
+            last_sync: s.last_sync.clone().or(last_sync_db),
+            last_error: s.last_error.clone(),
+            rate_limit: s.rate_limit.clone(),
+        }
+    };
+
     let auth = AuthState {
         provider: provider_name(config.github.auth_provider).to_string(),
         authenticated,
@@ -120,15 +137,22 @@ async fn state_handler(State(state): State<AppState>) -> Response {
         version: env!("CARGO_PKG_VERSION").to_string(),
         workspaces: config.workspaces.clone(),
         auth,
-        sync: SyncState {
-            last_sync,
-            running: false,
-        },
+        sync,
     };
 
     (
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::to_string(&response).unwrap_or_default(),
+    )
+        .into_response()
+}
+
+async fn sync_handler(State(state): State<AppState>) -> Response {
+    let _ = state.sync_trigger.send(()).await;
+    (
+        StatusCode::ACCEPTED,
+        [(header::CONTENT_TYPE, "application/json")],
+        r#"{"status":"accepted"}"#,
     )
         .into_response()
 }
@@ -182,6 +206,7 @@ mod tests {
         };
         let db = Database::open(&dir.path().join("data.db")).expect("open db");
         let token: Arc<dyn TokenProvider> = Arc::new(ClassicPat::new("ghp_test".into()));
+        let (sync_trigger, _rx) = tokio::sync::mpsc::channel(8);
         AppState {
             config: Arc::new(config),
             db: Arc::new(db),
@@ -195,6 +220,8 @@ mod tests {
                 ok: true,
                 message: None,
             }))),
+            sync_status: Arc::new(Mutex::new(SyncStatus::default())),
+            sync_trigger,
         }
     }
 
@@ -230,6 +257,22 @@ mod tests {
         assert_eq!(value["auth"]["authenticated"], true);
         assert_eq!(value["auth"]["login"], "octocat");
         assert_eq!(value["auth"]["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn sync_endpoint_accepts_request() {
+        let app = router(test_state());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/sync")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 
     #[tokio::test]
