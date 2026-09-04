@@ -129,6 +129,203 @@ CREATE TABLE IF NOT EXISTS sync_state (
         .context("upserting sync_state")?;
         Ok(())
     }
+
+    /// Upsert a repository by full name, returning its row id.
+    pub fn upsert_repo(&self, full_name: &str, html_url: Option<&str>) -> Result<i64> {
+        let (owner, name) = split_repo(full_name);
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let id = conn
+            .query_row(
+                "INSERT INTO repos (full_name, owner, name, html_url)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (full_name) DO UPDATE SET
+                   html_url = COALESCE(repos.html_url, excluded.html_url)
+                 RETURNING id",
+                params![full_name, owner, name, html_url.unwrap_or_default()],
+                |row| row.get(0),
+            )
+            .context("upserting repo")?;
+        Ok(id)
+    }
+
+    /// Upsert an issue or pull request belonging to `repo_id`.
+    pub fn upsert_issue(
+        &self,
+        repo_id: i64,
+        issue: &crate::models::GithubIssue,
+        kind: &str,
+        merged_at: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.execute(
+            "INSERT INTO issues
+               (repo_id, github_id, number, kind, title, state, author,
+                created_at, updated_at, closed_at, merged_at, html_url, api_url)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT (repo_id, kind, number) DO UPDATE SET
+               github_id = excluded.github_id,
+               title = excluded.title,
+               state = excluded.state,
+               author = excluded.author,
+               updated_at = excluded.updated_at,
+               closed_at = excluded.closed_at,
+               merged_at = excluded.merged_at,
+               html_url = excluded.html_url,
+               api_url = excluded.api_url,
+               created_at = COALESCE(issues.created_at, excluded.created_at)",
+            params![
+                repo_id,
+                issue.id,
+                issue.number,
+                kind,
+                issue.title,
+                issue.state,
+                issue.user.as_ref().map(|u| u.login.as_str()),
+                issue.created_at,
+                issue.updated_at,
+                issue.closed_at,
+                merged_at,
+                issue.html_url,
+                issue.url,
+            ],
+        )
+        .context("upserting issue")?;
+        Ok(())
+    }
+
+    /// Upsert a notification thread, resolving (and creating if needed) its
+    /// repository row. Threads without a repository are skipped.
+    pub fn upsert_thread(&self, thread: &crate::models::NotificationThread) -> Result<()> {
+        let Some(repo) = &thread.repository else {
+            return Ok(());
+        };
+        let repo_id = self.upsert_repo(&repo.full_name, Some(&repo.html_url))?;
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.execute(
+            "INSERT INTO threads
+               (thread_id, repo_id, subject_type, subject_title, subject_url,
+                subject_api_url, reason, unread, updated_at, last_read_at, api_url)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT (thread_id) DO UPDATE SET
+               repo_id = excluded.repo_id,
+               subject_type = excluded.subject_type,
+               subject_title = excluded.subject_title,
+               subject_url = excluded.subject_url,
+               subject_api_url = excluded.subject_api_url,
+               reason = excluded.reason,
+               unread = excluded.unread,
+               updated_at = excluded.updated_at,
+               last_read_at = excluded.last_read_at",
+            params![
+                thread.id,
+                repo_id,
+                thread.subject.kind,
+                thread.subject.title,
+                thread.subject.url,
+                thread.subject.url,
+                thread.reason,
+                thread.unread,
+                thread.updated_at,
+                thread.last_read_at,
+                thread.url,
+            ],
+        )
+        .context("upserting thread")?;
+        Ok(())
+    }
+
+    /// Set a thread's unread flag locally (after marking read on GitHub).
+    pub fn set_thread_unread(&self, thread_id: &str, unread: bool) -> Result<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.execute(
+            "UPDATE threads SET unread = ?2 WHERE thread_id = ?1",
+            params![thread_id, unread],
+        )
+        .context("updating thread unread")?;
+        Ok(())
+    }
+
+    /// Notification id, thread API url, and subject API url for unread
+    /// pull-request threads, used by the auto-dismiss pass.
+    pub fn get_unread_pr_threads(&self) -> Result<Vec<(String, String, String)>> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT thread_id, api_url, subject_api_url FROM threads
+                 WHERE unread = 1 AND subject_type = 'PullRequest'
+                   AND api_url IS NOT NULL AND subject_api_url IS NOT NULL",
+            )
+            .context("preparing unread PR threads")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .context("querying unread PR threads")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("reading unread PR thread row")?);
+        }
+        Ok(out)
+    }
+
+    /// Mark every repo as not watched (start of a watch sync pass).
+    pub fn clear_watched(&self) -> Result<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.execute("UPDATE repos SET is_watched = 0", [])
+            .context("clearing watched flags")?;
+        Ok(())
+    }
+
+    /// Upsert a watched repository and flag it as watched.
+    pub fn upsert_watched_repo(&self, full_name: &str, html_url: &str) -> Result<()> {
+        let id = self.upsert_repo(full_name, Some(html_url))?;
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.execute("UPDATE repos SET is_watched = 1 WHERE id = ?1", params![id])
+            .context("marking repo watched")?;
+        Ok(())
+    }
+
+    /// Record the last refresh time for a repository.
+    pub fn set_repo_refreshed(&self, full_name: &str, at: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.execute(
+            "UPDATE repos SET last_refreshed_at = ?2 WHERE full_name = ?1",
+            params![full_name, at],
+        )
+        .context("recording repo refresh")?;
+        Ok(())
+    }
+
+    /// Count rows in a table (used by tests and status reporting).
+    pub fn count(&self, table: &str) -> Result<i64> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .with_context(|| format!("counting {table}"))
+    }
+
+    /// Number of unread threads currently cached.
+    pub fn unread_thread_count(&self) -> Result<i64> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.query_row("SELECT COUNT(*) FROM threads WHERE unread = 1", [], |row| {
+            row.get(0)
+        })
+        .context("counting unread threads")
+    }
+}
+
+/// Split an `owner/repo` full name into its parts. Falls back to treating the
+/// whole string as the repo name when there is no slash.
+fn split_repo(full_name: &str) -> (&str, &str) {
+    match full_name.split_once('/') {
+        Some((owner, name)) => (owner, name),
+        None => (full_name, ""),
+    }
 }
 
 #[cfg(test)]

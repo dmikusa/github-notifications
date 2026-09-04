@@ -277,7 +277,7 @@ with the human before proceeding.
 
 - [x] Phase 0 — Scaffold & repo infrastructure
 - [x] Phase 1 — Auth
-- [ ] Phase 2 — Sync engine
+- [x] Phase 2 — Sync engine
 - [ ] Phase 3 — UI
 - [ ] Phase 4 — Extras
 - [ ] Phase 5 — Distribution

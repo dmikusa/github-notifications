@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use github_notifications::{api, auth, config, db, github, util};
+use github_notifications::{api, auth, config, db, github, sync, util};
 
 #[derive(Parser)]
 #[command(
@@ -41,7 +41,8 @@ async fn main() -> Result<()> {
     let config = config::Config::load(cli.config.as_deref())?;
 
     let data_dir = db::default_data_dir();
-    let db = db::Database::open(&data_dir.join("data.db")).context("opening local database")?;
+    let db =
+        Arc::new(db::Database::open(&data_dir.join("data.db")).context("opening local database")?);
 
     let token_store = auth::TokenStore::new(data_dir.join("auth.toml"));
     let token = auth::from_config(&config, token_store);
@@ -77,12 +78,16 @@ async fn main() -> Result<()> {
         util::open_browser(&format!("http://{addr}"));
     }
 
+    let engine = sync::SyncEngine::spawn(client.clone(), db.clone(), Arc::new(config.clone()));
+
     let app = api::router(api::AppState {
         config: Arc::new(config),
-        db: Arc::new(db),
+        db,
         token,
         github: client,
         validation,
+        sync_status: engine.status.clone(),
+        sync_trigger: engine.trigger.clone(),
     });
 
     let listener = tokio::net::TcpListener::bind(addr)
