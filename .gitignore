@@ -1,5 +1,5 @@
 /target
 Cargo.lock.bak
 *.log
-config.toml
+/config.toml
 auth.toml

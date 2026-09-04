@@ -20,6 +20,7 @@ Before working on any task, read the plan document to understand:
 - **Format**: `cargo fmt`
 - **Run**: `cargo run -- --config ./config.toml --bind 127.0.0.1:8080`
 - **Coverage**: `mkdir -p target/coverage && cargo llvm-cov --lcov --output-path target/coverage/lcov.info`
+- **Online checks**: `cargo online-checks` (runs the ignored live-GitHub smoke test via `cargo test -- --ignored`; requires `GITHUB_TOKEN` or a logged-in `gh`)
 
 ## Process Rules
 
