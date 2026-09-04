@@ -1,0 +1,56 @@
+<div id="view" data-view="queue">
+  <form class="filters" hx-get="/api/views/queue" hx-target="#view" hx-swap="outerHTML"
+        hx-trigger="change, submit">
+    <input type="hidden" name="ws" value="{{ ws }}">
+    <select name="kind" aria-label="Type">
+      <option value="all" {% if kind == "all" %}selected{% endif %}>All</option>
+      <option value="issue" {% if kind == "issue" %}selected{% endif %}>Issues</option>
+      <option value="pr" {% if kind == "pr" %}selected{% endif %}>Pull requests</option>
+    </select>
+    <label><input type="checkbox" name="unread" value="1" {% if unread %}checked{% endif %}> Unread only</label>
+    <input type="search" name="q" value="{{ q }}" placeholder="Search title">
+    <select name="sort" aria-label="Sort">
+      <option value="attention" {% if sort == "attention" %}selected{% endif %}>Attention</option>
+      <option value="updated" {% if sort == "updated" %}selected{% endif %}>Updated</option>
+      <option value="created" {% if sort == "created" %}selected{% endif %}>Created</option>
+      <option value="repo" {% if sort == "repo" %}selected{% endif %}>Repo</option>
+    </select>
+  </form>
+
+  <table class="data">
+    <thead>
+      <tr>
+        <th class="chk"><input type="checkbox" class="sel-all"></th>
+        <th>Repo</th>
+        <th>#</th>
+        <th>Title</th>
+        <th>Type</th>
+        <th>Updated</th>
+        <th>Thread</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in items %}
+      <tr class="{% if item.thread_unread %}row-unread{% endif %}">
+        <td class="chk"><input type="checkbox" class="sel" value="{{ item.id }}"
+             data-repo="{{ item.repo }}" data-html-url="{{ item.html_url }}"></td>
+        <td class="repo">{{ item.repo }}</td>
+        <td class="num">#{{ item.number }}</td>
+        <td class="title"><a href="{{ item.html_url }}" target="_blank" rel="noopener">{{ item.title }}</a></td>
+        <td><span class="badge kind-{{ item.kind }}">{{ item.kind }}</span></td>
+        <td class="time">{{ item.updated_at }}</td>
+        <td>{% if item.thread_unread %}<span class="badge unread">{% if let Some(reason) = item.thread_reason %}{{ reason }}{% else %}unread{% endif %}</span>{% endif %}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="7" class="empty">No items match.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <div class="bulk-bar" hidden>
+    <span class="sel-count"></span>
+    <button data-action="mark-read">Mark read</button>
+    <button data-action="mark-all-read">Mark all read</button>
+    <button data-action="open">Open in GitHub</button>
+  </div>
+</div>

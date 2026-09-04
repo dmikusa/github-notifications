@@ -365,12 +365,8 @@ fn record_rate_limit(status: &Arc<Mutex<SyncStatus>>, headers: &HeaderMap) {
 fn tracked_repos(config: &Config) -> Vec<String> {
     let mut set = BTreeSet::new();
     for workspace in &config.workspaces {
-        for repo_set in &workspace.repo_sets {
-            for repo in &repo_set.repos {
-                if !repo.is_empty() {
-                    set.insert(repo.clone());
-                }
-            }
+        for repo in workspace.tracked_repos() {
+            set.insert(repo);
         }
     }
     set.into_iter().collect()

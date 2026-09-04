@@ -9,9 +9,16 @@
 <body>
   <header class="topbar">
     <h1 class="brand">github-notifications</h1>
-    <nav id="nav" class="nav"></nav>
+    <nav class="nav" id="tabs">
+      <button class="tab active" data-view="queue">Queue</button>
+      <button class="tab" data-view="inbox">Inbox</button>
+      <button class="tab" data-view="repos">Repos</button>
+    </nav>
+    <select id="ws" class="ws-select" title="Workspace" aria-label="Workspace"></select>
+    <button id="sync" title="Sync now" aria-label="Sync now">Sync</button>
   </header>
-  <main id="main" class="main"></main>
+  <div id="status" class="status"></div>
+  <main id="view" class="main"></main>
   <script src="/app.js"></script>
 </body>
 </html>

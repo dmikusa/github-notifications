@@ -1,17 +1,17 @@
 // js/state.js:
 window.App = window.App || {};
 
-window.App.state = (() => {
-  let current = null;
+window.App.state = {
+  workspaces: [],
+  currentWorkspace: '',
+  currentView: 'queue',
 
-  async function refresh() {
-    current = await window.App.api.getState();
-    return current;
-  }
-
-  function get() {
-    return current;
-  }
-
-  return { refresh, get };
-})();
+  setWorkspaces(names) {
+    this.workspaces = names.slice();
+    if (!names.length) {
+      this.currentWorkspace = '';
+    } else if (!names.includes(this.currentWorkspace)) {
+      this.currentWorkspace = names[0];
+    }
+  },
+};
