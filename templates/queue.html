@@ -2,6 +2,12 @@
   <form class="filters" hx-get="/api/views/queue" hx-target="#view" hx-swap="outerHTML"
         hx-trigger="change, submit">
     <input type="hidden" name="ws" value="{{ ws }}">
+    <select name="repo_set" aria-label="Repo set">
+      <option value="all" {% if repo_set == "all" %}selected{% endif %}>All repo sets</option>
+      {% for set in repo_sets %}
+      <option value="{{ set }}" {% if repo_set == set %}selected{% endif %}>{{ set }}</option>
+      {% endfor %}
+    </select>
     <select name="kind" aria-label="Type">
       <option value="all" {% if kind == "all" %}selected{% endif %}>All</option>
       <option value="issue" {% if kind == "issue" %}selected{% endif %}>Issues</option>

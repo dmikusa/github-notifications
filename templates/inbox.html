@@ -2,6 +2,12 @@
   <form class="filters" hx-get="/api/views/inbox" hx-target="#view" hx-swap="outerHTML"
         hx-trigger="change, submit">
     <input type="hidden" name="ws" value="{{ ws }}">
+    <select name="repo_set" aria-label="Repo set">
+      <option value="all" {% if repo_set == "all" %}selected{% endif %}>All repo sets</option>
+      {% for set in repo_sets %}
+      <option value="{{ set }}" {% if repo_set == set %}selected{% endif %}>{{ set }}</option>
+      {% endfor %}
+    </select>
     <select name="type" aria-label="Type">
       <option value="all" {% if subject_type == "all" %}selected{% endif %}>All types</option>
       <option value="Issue" {% if subject_type == "Issue" %}selected{% endif %}>Issue</option>
@@ -63,5 +69,9 @@
     <button data-action="mark-read">Mark read</button>
     <button data-action="mark-all-read">Mark all read</button>
     <button data-action="open">Open in GitHub</button>
+  </div>
+
+  <div class="actions">
+    <button id="dismiss-closed-merged">Dismiss closed/merged</button>
   </div>
 </div>

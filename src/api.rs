@@ -67,6 +67,11 @@ pub fn router(state: AppState) -> Router {
             delete(repo_delete),
         )
         .route("/api/orgs/{org}/repos", get(org_repos))
+        .route("/api/workspaces", post(workspace_create))
+        .route(
+            "/api/notifications/dismiss-closed-merged",
+            post(dismiss_closed_merged),
+        )
         .fallback(static_handler)
         .with_state(state)
 }
@@ -265,6 +270,10 @@ struct SyncStatusResponse {
     last_error: Option<String>,
     /// Set when the cache was rebuilt (e.g. after a schema change).
     rebuild: Option<String>,
+    /// Whether a manual "dismiss closed/merged" pass is in flight.
+    dismiss_running: bool,
+    /// Count from the last completed manual dismiss pass.
+    last_dismiss: Option<usize>,
 }
 
 async fn sync_status_handler(State(state): State<AppState>) -> Response {
@@ -285,6 +294,8 @@ async fn sync_status_handler(State(state): State<AppState>) -> Response {
         last_sync: status.last_sync,
         last_error: status.last_error,
         rebuild: state.db.get_sync_state("last_rebuild").unwrap_or_default(),
+        dismiss_running: status.dismiss_running,
+        last_dismiss: status.last_dismiss,
     };
     (
         [(header::CONTENT_TYPE, "application/json")],
@@ -566,6 +577,56 @@ fn reload_config(state: &AppState) -> Result<()> {
     let config = config::read_file(&state.config_path)?;
     *state.config.write().expect("config lock poisoned") = config;
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct AddWorkspaceBody {
+    name: String,
+}
+
+async fn workspace_create(
+    State(state): State<AppState>,
+    Json(body): Json<AddWorkspaceBody>,
+) -> Response {
+    let result = async {
+        let name = body.name.trim().to_string();
+        if name.is_empty() {
+            anyhow::bail!("workspace name is required");
+        }
+        config::add_workspace(&state.config_path, &name)?;
+        reload_config(&state)?;
+        Ok::<_, anyhow::Error>(name)
+    }
+    .await;
+    json_response(result)
+}
+
+async fn dismiss_closed_merged(State(state): State<AppState>) -> Response {
+    {
+        let mut s = state.sync_status.lock().expect("sync status poisoned");
+        if s.dismiss_running {
+            return json_response(Err::<(), _>(anyhow::anyhow!(
+                "a dismiss is already running"
+            )));
+        }
+        s.dismiss_running = true;
+        s.last_dismiss = None;
+    }
+    // The pass can be slow (one fetch per unread PR thread), so run it in the
+    // background and report progress via /api/sync/status.
+    let worker = state.clone();
+    tokio::spawn(async move {
+        let result = crate::sync::dismiss_closed_merged(&worker.github, &worker.db).await;
+        let mut s = worker.sync_status.lock().expect("sync status poisoned");
+        s.dismiss_running = false;
+        match result {
+            Ok(n) => s.last_dismiss = Some(n),
+            Err(e) => {
+                tracing::warn!("dismiss closed/merged failed: {e}");
+            }
+        }
+    });
+    json_response(Ok::<_, anyhow::Error>("started"))
 }
 
 /// Mark a set of threads read on GitHub and locally. Returns the count marked.
@@ -956,6 +1017,54 @@ mod tests {
             sync_trigger,
         };
         (state, dir)
+    }
+
+    #[tokio::test]
+    async fn workspace_create_appends_and_reloads() {
+        let (state, _dir) = state_with_config_file(
+            "[github]\nauth_provider = \"gh-token\"\n\n[[workspaces]]\nname = \"personal\"\n",
+        );
+        let app = router(state.clone());
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/workspaces")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"work"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let raw = std::fs::read_to_string(&state.config_path).expect("read config");
+        assert!(raw.contains("work"));
+        let cfg = state.config.read().expect("lock");
+        assert_eq!(cfg.workspaces.len(), 2);
+        assert_eq!(cfg.workspaces[1].name, "work");
+        assert!(cfg.workspaces[1].repo_sets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn workspace_create_rejects_duplicate() {
+        let (state, _dir) = state_with_config_file(
+            "[github]\nauth_provider = \"gh-token\"\n\n[[workspaces]]\nname = \"personal\"\n",
+        );
+        let app = router(state.clone());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/workspaces")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"personal"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]

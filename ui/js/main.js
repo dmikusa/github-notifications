@@ -88,22 +88,27 @@ async function onSyncStatus(status) {
   }
 }
 
+function populateWorkspaces(state) {
+  window.App.state.setWorkspaces(state.workspaces.map((w) => w.name));
+  const wsSel = document.getElementById('ws');
+  wsSel.innerHTML = '';
+  state.workspaces.forEach((w) => {
+    const opt = document.createElement('option');
+    opt.value = w.name;
+    opt.textContent = w.name;
+    wsSel.appendChild(opt);
+  });
+  if (window.App.state.currentWorkspace) {
+    wsSel.value = window.App.state.currentWorkspace;
+  }
+}
+
 (async () => {
   try {
     const state = await window.App.api.getState();
-    window.App.state.setWorkspaces(state.workspaces.map((w) => w.name));
+    populateWorkspaces(state);
 
     const wsSel = document.getElementById('ws');
-    state.workspaces.forEach((w) => {
-      const opt = document.createElement('option');
-      opt.value = w.name;
-      opt.textContent = w.name;
-      wsSel.appendChild(opt);
-    });
-    if (window.App.state.currentWorkspace) {
-      wsSel.value = window.App.state.currentWorkspace;
-    }
-
     const auth = state.auth;
     let authText = `auth: ${auth.provider}`;
     if (auth.ok) {
@@ -126,6 +131,56 @@ async function onSyncStatus(status) {
     document.getElementById('sync').addEventListener('click', async () => {
       await window.App.api.postJSON('/api/sync', {});
       window.App.status.set('sync requested');
+    });
+
+    const dialog = document.getElementById('add-ws-dialog');
+    document.getElementById('add-ws').addEventListener('click', () => dialog.showModal());
+    document.getElementById('add-ws-cancel').addEventListener('click', () => dialog.close());
+    document.getElementById('add-ws-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const name = document.getElementById('new-ws-name').value.trim();
+      if (!name) return;
+      try {
+        await window.App.api.postJSON('/api/workspaces', { name });
+        populateWorkspaces(await window.App.api.getState());
+        window.App.state.currentWorkspace = name;
+        await window.App.views.reload();
+      } catch (err) {
+        window.App.status.set(`Add workspace failed: ${err.message}`, true);
+      }
+      dialog.close();
+      document.getElementById('new-ws-name').value = '';
+    });
+
+    // Manual "dismiss closed/merged" from the inbox view. Runs in the
+    // background; poll /api/sync/status until it reports completion.
+    document.addEventListener('click', async (e) => {
+      if (e.target.id !== 'dismiss-closed-merged') return;
+      const btn = e.target;
+      btn.disabled = true;
+      const original = btn.textContent;
+      btn.textContent = 'Dismissing\u2026';
+      try {
+        await window.App.api.postJSON('/api/notifications/dismiss-closed-merged', {});
+        window.App.status.set('Dismissing closed/merged notifications\u2026');
+        let count = null;
+        for (let i = 0; i < 180; i++) {
+          await new Promise((r) => setTimeout(r, 1000));
+          const st = await window.App.api.getJSON('/api/sync/status');
+          if (!st.dismiss_running) {
+            count = st.last_dismiss;
+            break;
+          }
+        }
+        window.App.status.set(
+          count === null ? 'Dismiss still running' : `Dismissed ${count || 0} closed/merged notification(s)`
+        );
+        await window.App.views.reload();
+      } catch (err) {
+        window.App.status.set(`Dismiss failed: ${err.message}`, true);
+      }
+      btn.disabled = false;
+      btn.textContent = original;
     });
 
     const status = await window.App.api.getJSON('/api/sync/status');
