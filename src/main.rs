@@ -38,7 +38,24 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let config = config::Config::load(cli.config.as_deref())?;
+    let loaded = config::Config::load(cli.config.as_deref())?;
+    let config = loaded.config;
+
+    if config.workspaces.is_empty() {
+        if loaded.created {
+            println!(
+                "Created a default config at {}.\nAdd a workspace and repo set to it, then run again.",
+                loaded.path.display()
+            );
+        } else {
+            eprintln!(
+                "No workspaces are configured.\nAdd a workspace and repo set to {}, then run again.",
+                loaded.path.display()
+            );
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     let data_dir = db::default_data_dir();
     let db =

@@ -98,10 +98,20 @@ pub struct Config {
     pub workspaces: Vec<Workspace>,
 }
 
+/// A loaded configuration plus the resolved file path and whether the file was
+/// just created (did not exist before this run).
+#[derive(Debug)]
+pub struct LoadedConfig {
+    pub config: Config,
+    pub path: PathBuf,
+    pub created: bool,
+}
+
 impl Config {
     /// Load configuration from `path`, or create and return a default config
-    /// file when it does not yet exist.
-    pub fn load(path: Option<&Path>) -> Result<Self> {
+    /// file when it does not yet exist. The returned [`LoadedConfig`] reports
+    /// whether the file was newly created.
+    pub fn load(path: Option<&Path>) -> Result<LoadedConfig> {
         let path = match path {
             Some(p) => p.to_path_buf(),
             None => default_config_path(),
@@ -112,16 +122,21 @@ impl Config {
                 .with_context(|| format!("reading config file {}", path.display()))?;
             let config: Config = toml::from_str(&raw)
                 .with_context(|| format!("parsing config file {}", path.display()))?;
-            return Ok(config);
+            return Ok(LoadedConfig {
+                config,
+                path,
+                created: false,
+            });
         }
 
         let config = Config::default();
         write_template(&path)?;
-        tracing::info!(
-            "created default config file at {} \u{2014} edit it to add credentials and workspaces",
-            path.display()
-        );
-        Ok(config)
+        tracing::info!("created default config file at {}", path.display());
+        Ok(LoadedConfig {
+            config,
+            path,
+            created: true,
+        })
     }
 
     /// Persist the config to `path`, creating parent directories and locking
@@ -295,10 +310,11 @@ mod tests {
         let path = dir.path().join("config.toml");
         assert!(!path.exists());
 
-        let config = Config::load(Some(&path)).expect("load");
+        let loaded = Config::load(Some(&path)).expect("load");
+        assert!(loaded.created);
         assert!(path.exists());
-        assert!(config.workspaces.is_empty());
-        assert_eq!(config.github.auth_provider, AuthProvider::Pat);
+        assert!(loaded.config.workspaces.is_empty());
+        assert_eq!(loaded.config.github.auth_provider, AuthProvider::Pat);
 
         // The written file is the commented example, not an empty serialization.
         let raw = fs::read_to_string(&path).expect("read");
@@ -341,9 +357,10 @@ name = "work"
         )
         .expect("write");
 
-        let config = Config::load(Some(&path)).expect("load");
-        assert_eq!(config.github.auth_provider, AuthProvider::GhToken);
-        assert_eq!(config.workspaces[0].name, "work");
+        let loaded = Config::load(Some(&path)).expect("load");
+        assert!(!loaded.created);
+        assert_eq!(loaded.config.github.auth_provider, AuthProvider::GhToken);
+        assert_eq!(loaded.config.workspaces[0].name, "work");
     }
 
     #[test]

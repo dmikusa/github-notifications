@@ -22,8 +22,10 @@ threads — beyond what github.com/notifications supports.
 
 ```console
 $ github-notifications
-# creates ~/.config/github-notifications/config.toml and a local SQLite cache,
-# then serves the UI at http://127.0.0.1:8080
+# First run: creates ~/.config/github-notifications/config.toml (a commented
+# example) and exits. Add a workspace + repo set to it, then run again.
+$ github-notifications
+# Serves the UI at http://127.0.0.1:8080 (bind with --bind, $HOST, or $PORT)
 ```
 
 Follow [docs/setup.md](docs/setup.md) to configure GitHub authentication
