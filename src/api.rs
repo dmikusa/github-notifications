@@ -17,9 +17,9 @@ use crate::{
     auth::TokenProvider,
     config::{self, AuthProvider, Config, Workspace},
     db::Database,
-    github::{self, RateLimit, Validation},
+    github::{self, next_link, RateLimit, Validation},
     models,
-    sync::SyncStatus,
+    sync::{self, SyncStatus},
     views,
 };
 
@@ -67,6 +67,11 @@ pub fn router(state: AppState) -> Router {
             delete(repo_delete),
         )
         .route("/api/orgs/{org}/repos", get(org_repos))
+        .route("/api/workspaces", post(workspace_create))
+        .route(
+            "/api/notifications/dismiss-closed-merged",
+            post(dismiss_closed_merged),
+        )
         .fallback(static_handler)
         .with_state(state)
 }
@@ -265,6 +270,10 @@ struct SyncStatusResponse {
     last_error: Option<String>,
     /// Set when the cache was rebuilt (e.g. after a schema change).
     rebuild: Option<String>,
+    /// Whether a manual "dismiss closed/merged" pass is in flight.
+    dismiss_running: bool,
+    /// Count from the last completed manual dismiss pass.
+    last_dismiss: Option<usize>,
 }
 
 async fn sync_status_handler(State(state): State<AppState>) -> Response {
@@ -285,6 +294,8 @@ async fn sync_status_handler(State(state): State<AppState>) -> Response {
         last_sync: status.last_sync,
         last_error: status.last_error,
         rebuild: state.db.get_sync_state("last_rebuild").unwrap_or_default(),
+        dismiss_running: status.dismiss_running,
+        last_dismiss: status.last_dismiss,
     };
     (
         [(header::CONTENT_TYPE, "application/json")],
@@ -506,58 +517,74 @@ async fn org_repos(
 ) -> Response {
     let result = async {
         let page = params.page.unwrap_or(1).max(1);
-        let page_str = page.to_string();
         let q = params.q.unwrap_or_default();
 
-        let (raw_repos, has_more) = if q.is_empty() {
-            let res = state
-                .github
-                .get(
-                    &format!("/orgs/{org}/repos"),
-                    &[("per_page", "100"), ("page", page_str.as_str())],
-                    None,
-                )
-                .await?;
-            ensure_success(&res.status, "list org repos")?;
-            let repos: Vec<models::WatchedRepo> = serde_json::from_slice(&res.body)?;
-            (repos, github::has_next(&res.headers))
-        } else {
-            // Search across the whole org by name (the plain org endpoint has
-            // no server-side filter and only pages a fixed slice).
-            #[derive(Deserialize)]
-            struct SearchResult {
-                items: Vec<models::WatchedRepo>,
-            }
-            let query = format!("org:{org} {q} in:name");
-            let res = state
-                .github
-                .get(
-                    "/search/repositories",
-                    &[
-                        ("q", query.as_str()),
-                        ("per_page", "100"),
-                        ("page", page_str.as_str()),
-                    ],
-                    None,
-                )
-                .await?;
-            ensure_success(&res.status, "search org repos")?;
-            let parsed: SearchResult = serde_json::from_slice(&res.body)?;
-            (parsed.items, github::has_next(&res.headers))
-        };
+        // The org's repo list is identical for every workspace, so cache it
+        // once per org and reuse it across workspaces. Only refetch when the
+        // cached copy is stale (same cadence as the repo refresh interval).
+        let cache_key = format!("org_repos:{org}");
+        let last = state.db.get_sync_state(&cache_key)?;
+        let refresh_interval = state
+            .config
+            .read()
+            .expect("config lock poisoned")
+            .github
+            .repo_refresh_interval_seconds;
+        if sync::due(&last, refresh_interval) {
+            let repos = fetch_all_org_repos(&state.github, &org).await?;
+            state.db.replace_org_repos(&org, &repos)?;
+            state.db.set_sync_state(&cache_key, &sync::now_utc())?;
+        }
 
-        let mut repos: Vec<OrgRepo> = raw_repos
-            .into_iter()
-            .map(|r| OrgRepo {
-                full_name: r.full_name,
-                html_url: r.html_url,
-            })
-            .collect();
-        repos.sort_by(|a, b| a.full_name.cmp(&b.full_name));
+        // Search is served from the cached list (a name filter), so once an
+        // org's repos are cached the org browser works instantly and offline.
+        let all = state.db.list_org_repos(&org, &q)?;
+        let per_page = 100usize;
+        let start = (page as usize - 1) * per_page;
+        let mut repos = Vec::new();
+        let mut has_more = false;
+        if start < all.len() {
+            let end = (start + per_page).min(all.len());
+            repos = all[start..end]
+                .iter()
+                .map(|r| OrgRepo {
+                    full_name: r.full_name.clone(),
+                    html_url: r.html_url.clone(),
+                })
+                .collect();
+            has_more = end < all.len();
+        }
         Ok::<_, anyhow::Error>(OrgReposResponse { repos, has_more })
     }
     .await;
     json_response(result)
+}
+
+/// Fetch every repo in an org by paging through `GET /orgs/{org}/repos`.
+async fn fetch_all_org_repos(
+    client: &github::Client,
+    org: &str,
+) -> Result<Vec<models::WatchedRepo>, anyhow::Error> {
+    let mut repos = Vec::new();
+    let mut page_url: Option<String> = None;
+    loop {
+        let response = match &page_url {
+            Some(url) => client.get_url(url, None).await?,
+            None => {
+                client
+                    .get(&format!("/orgs/{org}/repos"), &[("per_page", "100")], None)
+                    .await?
+            }
+        };
+        ensure_success(&response.status, "list org repos")?;
+        let page: Vec<models::WatchedRepo> = serde_json::from_slice(&response.body)?;
+        repos.extend(page);
+        page_url = next_link(&response.headers);
+        if page_url.is_none() {
+            break;
+        }
+    }
+    Ok(repos)
 }
 
 /// Reload the in-memory config from disk after a write-back so UI edits take
@@ -566,6 +593,56 @@ fn reload_config(state: &AppState) -> Result<()> {
     let config = config::read_file(&state.config_path)?;
     *state.config.write().expect("config lock poisoned") = config;
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct AddWorkspaceBody {
+    name: String,
+}
+
+async fn workspace_create(
+    State(state): State<AppState>,
+    Json(body): Json<AddWorkspaceBody>,
+) -> Response {
+    let result = async {
+        let name = body.name.trim().to_string();
+        if name.is_empty() {
+            anyhow::bail!("workspace name is required");
+        }
+        config::add_workspace(&state.config_path, &name)?;
+        reload_config(&state)?;
+        Ok::<_, anyhow::Error>(name)
+    }
+    .await;
+    json_response(result)
+}
+
+async fn dismiss_closed_merged(State(state): State<AppState>) -> Response {
+    {
+        let mut s = state.sync_status.lock().expect("sync status poisoned");
+        if s.dismiss_running {
+            return json_response(Err::<(), _>(anyhow::anyhow!(
+                "a dismiss is already running"
+            )));
+        }
+        s.dismiss_running = true;
+        s.last_dismiss = None;
+    }
+    // The pass can be slow (one fetch per unread PR thread), so run it in the
+    // background and report progress via /api/sync/status.
+    let worker = state.clone();
+    tokio::spawn(async move {
+        let result = crate::sync::dismiss_closed_merged(&worker.github, &worker.db).await;
+        let mut s = worker.sync_status.lock().expect("sync status poisoned");
+        s.dismiss_running = false;
+        match result {
+            Ok(n) => s.last_dismiss = Some(n),
+            Err(e) => {
+                tracing::warn!("dismiss closed/merged failed: {e}");
+            }
+        }
+    });
+    json_response(Ok::<_, anyhow::Error>("started"))
 }
 
 /// Mark a set of threads read on GitHub and locally. Returns the count marked.
@@ -743,6 +820,28 @@ mod tests {
         let app = router(test_state());
         let (status, _) = get_body(app, "/nope").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn queue_view_renders_filter_form() {
+        let app = router(test_state());
+        let (status, body) = get_body(app, "/api/views/queue?ws=personal&unread=true").await;
+        assert_eq!(status, StatusCode::OK);
+        // The rendered fragment must carry the filter form controls so the
+        // frontend's per-control htmx triggers can fire.
+        assert!(body.contains(r#"hx-get="/api/views/queue""#));
+        assert!(body.contains(r#"hx-trigger="change""#));
+        assert!(body.contains(r#"name="unread" value="true""#));
+    }
+
+    #[tokio::test]
+    async fn inbox_view_renders_filter_form() {
+        let app = router(test_state());
+        let (status, body) = get_body(app, "/api/views/inbox?ws=personal&unread=true").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#"hx-get="/api/views/inbox""#));
+        assert!(body.contains(r#"hx-trigger="change""#));
+        assert!(body.contains(r#"name="unread" value="true""#));
     }
 
     fn state_with_client(db: Arc<Database>, client: github::Client) -> AppState {
@@ -959,6 +1058,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_create_appends_and_reloads() {
+        let (state, _dir) = state_with_config_file(
+            "[github]\nauth_provider = \"gh-token\"\n\n[[workspaces]]\nname = \"personal\"\n",
+        );
+        let app = router(state.clone());
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/workspaces")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"work"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let raw = std::fs::read_to_string(&state.config_path).expect("read config");
+        assert!(raw.contains("work"));
+        let cfg = state.config.read().expect("lock");
+        assert_eq!(cfg.workspaces.len(), 2);
+        assert_eq!(cfg.workspaces[1].name, "work");
+        assert!(cfg.workspaces[1].repo_sets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn workspace_create_rejects_duplicate() {
+        let (state, _dir) = state_with_config_file(
+            "[github]\nauth_provider = \"gh-token\"\n\n[[workspaces]]\nname = \"personal\"\n",
+        );
+        let app = router(state.clone());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/workspaces")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"personal"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
     async fn repo_set_endpoints_update_config() {
         let (state, _dir) = state_with_config_file(
             "[github]\nauth_provider = \"gh-token\"\n\n[[workspaces]]\nname = \"personal\"\n",
@@ -1052,42 +1199,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn org_repos_sorts_and_searches() {
+    async fn org_repos_caches_and_searches_across_workspaces() {
+        use axum::http::HeaderMap;
         use axum::routing::get;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let app = Router::new()
-            .route(
-                "/orgs/o/repos",
-                get(|| async {
-                    // Deliberately unsorted; the handler must sort by name.
-                    (
-                        [(
-                            "link",
-                            "<https://api.github.com/orgs/o/repos?page=2>; rel=\"next\"",
-                        )],
-                        r#"[
-                        {"full_name":"o/repo-b","html_url":"https://github.com/o/repo-b"},
-                        {"full_name":"o/repo-a","html_url":"https://github.com/o/repo-a"}
-                    ]"#,
-                    )
-                }),
-            )
-            .route(
-                "/search/repositories",
-                get(|| async {
-                    (
-                        [(
-                            "link",
-                            "<https://api.github.com/search/repositories?page=2>; rel=\"next\"",
-                        )],
-                        r#"{"total_count":1,"items":[{"full_name":"o/repo-a","html_url":"https://github.com/o/repo-a"}]}"#,
-                    )
-                }),
-            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let base = format!("http://{}", listener.local_addr().expect("addr"));
+
+        // Mock `GET /orgs/o/repos` with two pages (150 + 50 repos). The next
+        // link points back at the local mock so the handler's pagination loop
+        // (which follows absolute `Link` URLs) can be exercised.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/orgs/o/repos",
+            get({
+                let calls = calls.clone();
+                let base = base.clone();
+                move |req: axum::http::Request<Body>| {
+                    let calls = calls.clone();
+                    let base = base.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let page_two = req.uri().query().is_some_and(|q| q.contains("page=2"));
+                        let (repos, link): (String, Option<String>) = if page_two {
+                            (
+                                (151..=200)
+                                    .map(|n| format!(r#"{{"full_name":"o/repo-{n:03}","html_url":"https://github.com/o/repo-{n:03}"}}"#))
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                                None,
+                            )
+                        } else {
+                            (
+                                (1..=150)
+                                    .map(|n| format!(r#"{{"full_name":"o/repo-{n:03}","html_url":"https://github.com/o/repo-{n:03}"}}"#))
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                                Some(format!("<{base}/orgs/o/repos?page=2>; rel=\"next\"")),
+                            )
+                        };
+                        let mut headers = HeaderMap::new();
+                        if let Some(link) = link {
+                            headers.insert("link", link.parse().expect("link header"));
+                        }
+                        (headers, format!("[{repos}]"))
+                    }
+                }
+            }),
+        );
         tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve");
         });
@@ -1097,50 +1259,53 @@ mod tests {
         let client = github::Client::with_base(Arc::new(ClassicPat::new("ghp_x".into())), &base);
         let app = router(state_with_client(db, client));
 
-        // Without a query: sorted by name.
-        let response = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/api/orgs/o/repos")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("dispatch");
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = response
-            .into_body()
-            .collect()
-            .await
-            .expect("body")
-            .to_bytes();
-        let body = String::from_utf8_lossy(&bytes);
-        let a = body.find("o/repo-a").expect("repo-a present");
-        let b = body.find("o/repo-b").expect("repo-b present");
-        assert!(a < b, "repos should be sorted alphabetically");
+        let fetch = |uri: String| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri(&uri)
+                            .body(Body::empty())
+                            .expect("request"),
+                    )
+                    .await
+                    .expect("dispatch");
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("body")
+                    .to_bytes();
+                String::from_utf8_lossy(&bytes).to_string()
+            }
+        };
+
+        // First load fetches both pages and caches the whole org.
+        let body = fetch("/api/orgs/o/repos".to_string()).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "two pages fetched once");
+        assert!(body.contains("\"o/repo-001\""));
+        assert!(!body.contains("\"o/repo-101\""), "page 1 is the first 100");
         assert!(body.contains("\"has_more\":true"));
 
-        // With a query: hits the search endpoint.
-        let response = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/api/orgs/o/repos?q=repo-a")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("dispatch");
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = response
-            .into_body()
-            .collect()
-            .await
-            .expect("body")
-            .to_bytes();
-        let body = String::from_utf8_lossy(&bytes);
-        assert!(body.contains("o/repo-a"));
-        assert!(!body.contains("o/repo-b"));
-        assert!(body.contains("\"has_more\":true"));
+        // Second load for a new workspace is served from the shared cache.
+        let body = fetch("/api/orgs/o/repos".to_string()).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "cache hit, no refetch");
+        assert!(body.contains("\"o/repo-001\""));
+
+        // Pagination slices the cached list.
+        let body = fetch("/api/orgs/o/repos?page=2".to_string()).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(body.contains("\"o/repo-101\""));
+        assert!(body.contains("\"o/repo-200\""));
+        assert!(body.contains("\"has_more\":false"));
+
+        // Search filters the cached list; no GitHub search endpoint is hit.
+        let body = fetch("/api/orgs/o/repos?q=repo-001".to_string()).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(body.contains("o/repo-001"));
+        assert!(!body.contains("o/repo-002"));
+        assert!(body.contains("\"has_more\":false"));
     }
 }

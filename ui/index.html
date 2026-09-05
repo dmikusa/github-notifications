@@ -16,11 +16,23 @@
       <button class="tab" data-view="settings">Settings</button>
     </nav>
     <select id="ws" class="ws-select" title="Workspace" aria-label="Workspace"></select>
+    <button id="add-ws" title="Add workspace" aria-label="Add workspace">+</button>
     <button id="sync" title="Sync now" aria-label="Sync now">Sync</button>
   </header>
   <div id="status" class="status"></div>
   <div id="notice" class="notice" hidden></div>
   <main id="view" class="main"></main>
+
+  <dialog id="add-ws-dialog">
+    <form id="add-ws-form">
+      <p class="view-title">New workspace name</p>
+      <input id="new-ws-name" type="text" required autofocus>
+      <menu class="dialog-actions">
+        <button type="button" id="add-ws-cancel">Cancel</button>
+        <button type="submit" class="primary">Create</button>
+      </menu>
+    </form>
+  </dialog>
   <script src="/app.js"></script>
 </body>
 </html>
