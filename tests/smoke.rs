@@ -1,8 +1,10 @@
 //! Online smoke test against the live GitHub API.
 //!
-//! Skipped by default. Run with `cargo online-checks` (alias for
-//! `cargo test -- --ignored`). Uses `GITHUB_TOKEN` if set, otherwise the `gh`
-//! CLI's token when `gh` is logged in. Skips cleanly when neither is available.
+//! Part of the `online_` ignored-test group. Skipped by default; run with
+//! `cargo online-checks` (alias for `cargo test -- --ignored online_`). Uses
+//! `GITHUB_TOKEN` if set, otherwise the `gh` CLI's token when `gh` is logged
+//! in. Skips cleanly when neither is available. See `docs/testing.md` for the
+//! group conventions.
 
 use std::sync::Arc;
 
@@ -16,7 +18,7 @@ use github_notifications::{
 
 #[tokio::test]
 #[ignore = "requires live GitHub credentials; run via `cargo online-checks`"]
-async fn live_sync_polls_github() {
+async fn online_live_sync_polls_github() {
     let Some(provider) = live_provider() else {
         eprintln!("skipping live smoke test: no GITHUB_TOKEN and gh is not logged in");
         return;
