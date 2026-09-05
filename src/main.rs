@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -17,8 +17,8 @@ struct Cli {
     #[arg(long)]
     config: Option<PathBuf>,
 
-    /// Address to bind the HTTP server (defaults to 127.0.0.1:8080, or
-    /// 0.0.0.0:$PORT when the PORT environment variable is set)
+    /// Address to bind the HTTP server (defaults to $HOST:$PORT, or
+    /// 127.0.0.1:8080 when those are unset)
     #[arg(long)]
     bind: Option<SocketAddr>,
 
@@ -97,20 +97,36 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Determine the listen address: explicit `--bind`, then `$PORT` (container),
-/// then the localhost default.
+/// Determine the listen address: explicit `--bind`, then `$HOST:$PORT`
+/// (defaults to `127.0.0.1:8080` so the server stays on loopback).
 fn resolve_bind(cli_bind: Option<SocketAddr>) -> SocketAddr {
-    resolve_bind_with_port(cli_bind, std::env::var("PORT").ok())
+    resolve_bind_with_env(
+        cli_bind,
+        std::env::var("HOST").ok(),
+        std::env::var("PORT").ok(),
+    )
 }
 
-fn resolve_bind_with_port(cli_bind: Option<SocketAddr>, port: Option<String>) -> SocketAddr {
+fn resolve_bind_with_env(
+    cli_bind: Option<SocketAddr>,
+    host: Option<String>,
+    port: Option<String>,
+) -> SocketAddr {
     if let Some(addr) = cli_bind {
         return addr;
     }
-    if let Some(port) = port.and_then(|p| p.parse::<u16>().ok()) {
-        return SocketAddr::from(([0, 0, 0, 0], port));
+    let host = host
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let port = port.and_then(|p| p.parse::<u16>().ok()).unwrap_or(8080);
+    SocketAddr::new(parse_host(&host), port)
+}
+
+fn parse_host(host: &str) -> IpAddr {
+    match host {
+        "localhost" => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        other => other.parse().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
     }
-    SocketAddr::from(([127, 0, 0, 1], 8080))
 }
 
 #[cfg(test)]
@@ -121,23 +137,39 @@ mod tests {
     fn bind_prefers_explicit() {
         let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
         assert_eq!(
-            resolve_bind_with_port(Some(addr), Some("9090".into())),
+            resolve_bind_with_env(Some(addr), Some("0.0.0.0".into()), Some("9090".into())),
             addr
         );
     }
 
     #[test]
-    fn bind_uses_port() {
+    fn bind_uses_port_on_localhost() {
         assert_eq!(
-            resolve_bind_with_port(None, Some("9090".into())),
+            resolve_bind_with_env(None, None, Some("9090".into())),
+            SocketAddr::from(([127, 0, 0, 1], 9090))
+        );
+    }
+
+    #[test]
+    fn bind_uses_host_override() {
+        assert_eq!(
+            resolve_bind_with_env(None, Some("0.0.0.0".into()), Some("9090".into())),
             SocketAddr::from(([0, 0, 0, 0], 9090))
+        );
+    }
+
+    #[test]
+    fn bind_maps_localhost() {
+        assert_eq!(
+            resolve_bind_with_env(None, Some("localhost".into()), None),
+            SocketAddr::from(([127, 0, 0, 1], 8080))
         );
     }
 
     #[test]
     fn bind_defaults_to_localhost() {
         assert_eq!(
-            resolve_bind_with_port(None, None),
+            resolve_bind_with_env(None, None, None),
             SocketAddr::from(([127, 0, 0, 1], 8080))
         );
     }

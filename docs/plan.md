@@ -164,7 +164,7 @@ PATs; empirical testing confirmed OAuth app tokens with `repo` scope also work
 3. **OAuth device flow** (`oauth-device`) — browser authorize flow, stores the
    token locally; useful without gh installed.
 
-Setup steps and scope requirements are documented in `SETUP.md`.
+Setup steps and scope requirements are documented in `docs/setup.md`.
 
 ### Sync all workspaces, dedupe
 
@@ -216,7 +216,7 @@ with the human before proceeding.
 - Cargo project: config loading (TOML), SQLite schema, embedded UI,
   `/api/state`, static serving + JS concat.
 - Container-friendly env handling (`PORT`, `GHNOTIFY_DATA_DIR`, `GITHUB_TOKEN`).
-- Docs: `docs/plan.md`, `docs/architecture.md`, `SETUP.md`.
+- Docs: `docs/plan.md`, `docs/architecture.md`, `docs/setup.md`.
 - CI: `cargo fmt`/`clippy`/`test` on PR + zizmor job.
 - Renovate config + workflow.
 - cargo-dist init (workflow, installers, targets).

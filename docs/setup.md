@@ -96,11 +96,44 @@ Notes:
 | `workspaces[].repo_sets[].name` | — | Repo set name |
 | `workspaces[].repo_sets[].repos` | `[]` | Explicit `owner/repo` list |
 
+On first run the daemon writes a commented example config to
+`~/.config/github-notifications/config.toml` (or `$XDG_CONFIG_HOME`). The
+plain equivalent, without comments:
+
+```toml
+[github]
+auth_provider = "pat"
+auth_token = ""
+oauth_client_id = ""
+poll_interval_seconds = 300
+repo_refresh_interval_seconds = 600
+
+[[workspaces]]
+name = "personal"
+auto_dismiss_closed_merged = false
+
+[[workspaces.repo_sets]]
+name = "open-source"
+repos = [
+  "paketo-buildpacks/paketo",
+  "paketo-community/anthology",
+]
+
+[[workspaces.repo_sets]]
+name = "work"
+repos = ["your-company/tooling"]
+```
+
 ## Environment variables
 
 | Variable | Purpose |
 | --- | --- |
 | `GITHUB_TOKEN` | Classic PAT override when `auth_token` is empty |
-| `PORT` | Container: bind `0.0.0.0:$PORT` (overrides default) |
+| `HOST` | Listen address override (default `127.0.0.1`); use `0.0.0.0` to expose the server beyond loopback |
+| `PORT` | Listen port override (default `8080`) |
 | `GHNOTIFY_DATA_DIR` | Override the SQLite data directory |
 | `RUST_LOG` | Log level (e.g. `debug`, `info`) |
+
+The server listens on `127.0.0.1:8080` by default. Set `HOST=0.0.0.0` (with
+`PORT` if desired) to make it reachable from other machines, e.g. in a
+container.

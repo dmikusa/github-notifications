@@ -116,8 +116,11 @@ impl Config {
         }
 
         let config = Config::default();
-        config.save(&path)?;
-        tracing::info!("created default config file at {}", path.display());
+        write_template(&path)?;
+        tracing::info!(
+            "created default config file at {} \u{2014} edit it to add credentials and workspaces",
+            path.display()
+        );
         Ok(config)
     }
 
@@ -148,6 +151,72 @@ impl Config {
             std::env::var("GITHUB_TOKEN").unwrap_or_default()
         }
     }
+}
+
+/// A full, commented example configuration written to disk on first run so
+/// new users can see every option and an example workspace.
+const CONFIG_TEMPLATE: &str = r#"# github-notifications configuration.
+#
+# Created on first run. Edit this file and restart the app to apply changes.
+# See docs/setup.md for authentication setup and a plain example.
+
+[github]
+# Which credential source to use:
+#   pat          - a classic personal access token (auth_token or GITHUB_TOKEN)
+#   gh-token     - reuse the GitHub CLI's token (requires a logged-in `gh`)
+#   oauth-device - browser OAuth device flow (uses oauth_client_id)
+auth_provider = "pat"
+
+# Classic PAT. Only used when auth_provider = "pat".
+# Can also be provided via the GITHUB_TOKEN environment variable.
+auth_token = ""
+
+# OAuth app client ID. Only used when auth_provider = "oauth-device".
+oauth_client_id = ""
+
+# How often to poll GitHub for new notifications, in seconds.
+poll_interval_seconds = 300
+
+# How often to refresh open issues and pull requests for each tracked repo,
+# in seconds.
+repo_refresh_interval_seconds = 600
+
+# Workspaces group repos and saved filters into separate views (e.g. personal
+# vs work). Each workspace has one or more repo sets: explicit lists of repos
+# to track. Orgs are not wildcards; every tracked repo must be listed.
+#
+# Uncomment and edit the example below to add your first workspace.
+#
+# [[workspaces]]
+# name = "personal"
+# # When enabled, threads for closed + merged pull requests are auto-marked read.
+# auto_dismiss_closed_merged = false
+#
+# [[workspaces.repo_sets]]
+# name = "open-source"
+# repos = [
+#   "paketo-buildpacks/paketo",
+#   "paketo-community/anthology",
+# ]
+#
+# [[workspaces.repo_sets]]
+# name = "work"
+# repos = ["your-company/tooling"]
+"#;
+
+/// Write the commented example configuration to `path`, creating parent
+/// directories and locking down permissions.
+fn write_template(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating config directory {}", parent.display()))?;
+    }
+    let mut file = fs::File::create(path)
+        .with_context(|| format!("creating config file {}", path.display()))?;
+    file.write_all(CONFIG_TEMPLATE.as_bytes())
+        .with_context(|| format!("writing config file {}", path.display()))?;
+    set_private_permissions(path)?;
+    Ok(())
 }
 
 /// Resolve the default configuration path following the XDG base directory
@@ -228,6 +297,30 @@ mod tests {
         assert!(path.exists());
         assert!(config.workspaces.is_empty());
         assert_eq!(config.github.auth_provider, AuthProvider::Pat);
+
+        // The written file is the commented example, not an empty serialization.
+        let raw = fs::read_to_string(&path).expect("read");
+        assert!(raw.contains("# github-notifications configuration"));
+        assert!(raw.contains("auto_dismiss_closed_merged"));
+    }
+
+    #[test]
+    fn template_parses_as_valid_config() {
+        let config: Config = toml::from_str(CONFIG_TEMPLATE).expect("template parses");
+        assert_eq!(config.github.auth_provider, AuthProvider::Pat);
+        assert_eq!(config.github.poll_interval_seconds, 300);
+        assert!(config.workspaces.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn template_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        write_template(&path).expect("write template");
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]
