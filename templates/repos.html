@@ -30,7 +30,7 @@
         <td class="time">{% if let Some(ts) = item.last_refreshed_at %}{{ ts }}{% endif %}</td>
       </tr>
       {% else %}
-      <tr><td colspan="5" class="empty">{% if synced %}No repos match your filters.{% else %}<span class="spinner" aria-hidden="true"></span>Loading data from GitHub…{% endif %}</td></tr>
+      <tr><td colspan="5" class="empty">No repos match your filters.</td></tr>
       {% endfor %}
     </tbody>
   </table>

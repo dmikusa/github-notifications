@@ -42,6 +42,7 @@ pub fn router(state: AppState) -> Router {
         .route("/app.js", get(app_js_handler))
         .route("/api/state", get(state_handler))
         .route("/api/sync", post(sync_handler))
+        .route("/api/sync/status", get(sync_status_handler))
         .route("/api/views/queue", get(queue_view))
         .route("/api/views/inbox", get(inbox_view))
         .route("/api/views/repos", get(repos_view))
@@ -193,7 +194,7 @@ async fn queue_view(
     Query(params): Query<views::QueueParams>,
 ) -> Response {
     let ws = views::resolve_workspace(&state.config, &params.ws);
-    match views::render_queue(&state.db, ws, &params, synced(&state.db)) {
+    match views::render_queue(&state.db, ws, &params) {
         Ok(html) => html_response(html),
         Err(e) => json_response(Err::<(), _>(e)),
     }
@@ -204,7 +205,7 @@ async fn inbox_view(
     Query(params): Query<views::InboxParams>,
 ) -> Response {
     let ws = views::resolve_workspace(&state.config, &params.ws);
-    match views::render_inbox(&state.db, ws, &params, synced(&state.db)) {
+    match views::render_inbox(&state.db, ws, &params) {
         Ok(html) => html_response(html),
         Err(e) => json_response(Err::<(), _>(e)),
     }
@@ -215,18 +216,44 @@ async fn repos_view(
     Query(params): Query<views::RepoParams>,
 ) -> Response {
     let ws = views::resolve_workspace(&state.config, &params.ws);
-    match views::render_repos(&state.db, ws, &params, synced(&state.db)) {
+    match views::render_repos(&state.db, ws, &params) {
         Ok(html) => html_response(html),
         Err(e) => json_response(Err::<(), _>(e)),
     }
 }
 
-/// Whether a sync has ever completed (the cache has been populated at least
-/// once). Distinct from the DB merely being empty.
-fn synced(db: &Database) -> bool {
-    db.get_sync_state("last_sync")
-        .map(|v| v.is_some())
-        .unwrap_or(false)
+#[derive(Serialize)]
+struct SyncStatusResponse {
+    /// Whether the cache has been populated by at least one completed sync.
+    populated: bool,
+    running: bool,
+    last_sync: Option<String>,
+    last_error: Option<String>,
+}
+
+async fn sync_status_handler(State(state): State<AppState>) -> Response {
+    let status = state
+        .sync_status
+        .lock()
+        .expect("sync status poisoned")
+        .clone();
+    let populated = status.last_sync.is_some()
+        || state
+            .db
+            .get_sync_state("last_sync")
+            .map(|v| v.is_some())
+            .unwrap_or(false);
+    let response = SyncStatusResponse {
+        populated,
+        running: status.running,
+        last_sync: status.last_sync,
+        last_error: status.last_error,
+    };
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&response).unwrap_or_default(),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
