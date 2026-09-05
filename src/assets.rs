@@ -20,6 +20,7 @@ pub const JS_BUNDLE: &[&str] = &[
     "js/views/queue.js",
     "js/views/inbox.js",
     "js/views/repos.js",
+    "js/views/settings.js",
     "js/views/workspaces.js",
     "js/main.js",
 ];

@@ -19,15 +19,24 @@ window.App.api = (() => {
     return res.text();
   }
 
-  async function postJSON(url, body) {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) throw new Error(`POST ${url} failed: ${res.status}`);
+  async function request(method, url, body) {
+    const opts = { method, headers: {} };
+    if (body !== undefined) {
+      opts.headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(body);
+    }
+    const res = await fetch(url, opts);
+    if (!res.ok) throw new Error(`${method} ${url} failed: ${res.status}`);
     return res.json();
   }
 
-  return { getJSON, getState, getView, postJSON };
+  async function postJSON(url, body) {
+    return request('POST', url, body);
+  }
+
+  async function deleteJSON(url) {
+    return request('DELETE', url);
+  }
+
+  return { getJSON, getState, getView, postJSON, deleteJSON };
 })();

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
 
 /// The default configuration file name used within the config directory.
 pub const CONFIG_FILE_NAME: &str = "config.toml";
@@ -236,6 +237,161 @@ fn write_template(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Parse an existing config file (no default is created).
+pub fn read_file(path: &Path) -> Result<Config> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("reading config file {}", path.display()))?;
+    toml::from_str(&raw).with_context(|| format!("parsing config file {}", path.display()))
+}
+
+/// Create or replace a repo set in `workspace` with the given `repos`,
+/// preserving comments in the rest of the file.
+pub fn add_repo_set(path: &Path, workspace: &str, name: &str, repos: &[String]) -> Result<()> {
+    let mut doc = load_doc(path)?;
+    let ws = workspace_table_mut(&mut doc, workspace)?;
+    let set = repo_set_mut(ws, name)?;
+    let mut array = toml_edit::Array::new();
+    for repo in repos {
+        if !repo.is_empty() {
+            array.push(
+                toml_edit::value(repo.as_str())
+                    .into_value()
+                    .expect("repo value"),
+            );
+        }
+    }
+    set.insert("repos", Item::Value(array.into()));
+    write_doc(path, &doc)
+}
+
+/// Remove a repo set from `workspace`.
+pub fn remove_repo_set(path: &Path, workspace: &str, name: &str) -> Result<()> {
+    let mut doc = load_doc(path)?;
+    let Some(workspaces) = doc["workspaces"].as_array_of_tables_mut() else {
+        anyhow::bail!("workspace {workspace:?} not found");
+    };
+    let Some(ws) = workspaces
+        .iter_mut()
+        .find(|t| t.get("name").and_then(Item::as_str) == Some(workspace))
+    else {
+        anyhow::bail!("workspace {workspace:?} not found");
+    };
+    let Some(sets) = ws["repo_sets"].as_array_of_tables_mut() else {
+        anyhow::bail!("repo set {name:?} not found");
+    };
+    let before = sets.len();
+    sets.retain(|t| t.get("name").and_then(Item::as_str) != Some(name));
+    if sets.len() == before {
+        anyhow::bail!("repo set {name:?} not found");
+    }
+    write_doc(path, &doc)
+}
+
+/// Remove a single repo from a repo set.
+pub fn remove_repo(path: &Path, workspace: &str, set_name: &str, repo: &str) -> Result<()> {
+    let mut doc = load_doc(path)?;
+    let Some(workspaces) = doc["workspaces"].as_array_of_tables_mut() else {
+        anyhow::bail!("workspace {workspace:?} not found");
+    };
+    let Some(ws) = workspaces
+        .iter_mut()
+        .find(|t| t.get("name").and_then(Item::as_str) == Some(workspace))
+    else {
+        anyhow::bail!("workspace {workspace:?} not found");
+    };
+    let Some(sets) = ws["repo_sets"].as_array_of_tables_mut() else {
+        anyhow::bail!("repo set {set_name:?} not found");
+    };
+    let Some(set) = sets
+        .iter_mut()
+        .find(|t| t.get("name").and_then(Item::as_str) == Some(set_name))
+    else {
+        anyhow::bail!("repo set {set_name:?} not found");
+    };
+    let Some(array) = set["repos"].as_array_mut() else {
+        anyhow::bail!("repo set {set_name:?} has no repos");
+    };
+    let before = array.len();
+    array.retain(|v| v.as_str() != Some(repo));
+    if array.len() == before {
+        anyhow::bail!("repo {repo:?} not found");
+    }
+    write_doc(path, &doc)
+}
+
+fn load_doc(path: &Path) -> Result<DocumentMut> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("reading config file {}", path.display()))?;
+    raw.parse::<DocumentMut>()
+        .with_context(|| format!("parsing config file {}", path.display()))
+}
+
+fn write_doc(path: &Path, doc: &DocumentMut) -> Result<()> {
+    fs::write(path, doc.to_string())
+        .with_context(|| format!("writing config file {}", path.display()))?;
+    set_private_permissions(path)?;
+    Ok(())
+}
+
+/// Find the workspace table by name, creating it (and the workspaces array)
+/// when missing.
+fn workspace_table_mut<'a>(doc: &'a mut DocumentMut, workspace: &str) -> Result<&'a mut Table> {
+    if !doc.contains_key("workspaces") {
+        doc.insert("workspaces", Item::ArrayOfTables(ArrayOfTables::new()));
+    }
+    let exists = doc["workspaces"]
+        .as_array_of_tables()
+        .map(|ws| {
+            ws.iter()
+                .any(|t| t.get("name").and_then(Item::as_str) == Some(workspace))
+        })
+        .unwrap_or(false);
+    if !exists {
+        let workspaces = doc["workspaces"]
+            .as_array_of_tables_mut()
+            .context("workspaces is not a table array")?;
+        let mut table = Table::new();
+        table.insert("name", value(workspace));
+        workspaces.push(table);
+    }
+    Ok(doc["workspaces"]
+        .as_array_of_tables_mut()
+        .context("workspaces is not a table array")?
+        .iter_mut()
+        .find(|t| t.get("name").and_then(Item::as_str) == Some(workspace))
+        .expect("workspace present"))
+}
+
+/// Find the repo set table by name within a workspace table, creating it when
+/// missing.
+fn repo_set_mut<'a>(ws: &'a mut Table, set_name: &str) -> Result<&'a mut Table> {
+    if !ws.contains_key("repo_sets") {
+        ws.insert("repo_sets", Item::ArrayOfTables(ArrayOfTables::new()));
+    }
+    let exists = ws["repo_sets"]
+        .as_array_of_tables()
+        .map(|sets| {
+            sets.iter()
+                .any(|t| t.get("name").and_then(Item::as_str) == Some(set_name))
+        })
+        .unwrap_or(false);
+    if !exists {
+        let sets = ws["repo_sets"]
+            .as_array_of_tables_mut()
+            .context("repo_sets is not a table array")?;
+        let mut table = Table::new();
+        table.insert("name", value(set_name));
+        table.insert("repos", Item::Value(toml_edit::Array::new().into()));
+        sets.push(table);
+    }
+    Ok(ws["repo_sets"]
+        .as_array_of_tables_mut()
+        .context("repo_sets is not a table array")?
+        .iter_mut()
+        .find(|t| t.get("name").and_then(Item::as_str) == Some(set_name))
+        .expect("repo set present"))
+}
+
 /// Resolve the default configuration path following the XDG base directory
 /// specification on Unix and the conventional macOS location.
 fn default_config_path() -> PathBuf {
@@ -400,5 +556,97 @@ bogus = true
             ..Default::default()
         };
         assert_eq!(config.effective_token(), "config-token");
+    }
+
+    fn editor_config(dir: &Path, body: &str) -> PathBuf {
+        let path = dir.join("config.toml");
+        fs::write(&path, body).expect("write config");
+        path
+    }
+
+    #[test]
+    fn editor_adds_repo_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = editor_config(
+            dir.path(),
+            "[github]\nauth_provider = \"gh-token\"\n\n[[workspaces]]\nname = \"personal\"\n",
+        );
+        add_repo_set(&path, "personal", "mine", &["a/r".into(), "b/r".into()]).expect("add");
+        let config = read_file(&path).expect("read");
+        assert_eq!(config.workspaces.len(), 1);
+        assert_eq!(config.workspaces[0].repo_sets[0].name, "mine");
+        assert_eq!(
+            config.workspaces[0].repo_sets[0].repos,
+            vec!["a/r".to_string(), "b/r".to_string()]
+        );
+    }
+
+    #[test]
+    fn editor_replaces_repo_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = editor_config(
+            dir.path(),
+            "[github]\n\nauth_provider = \"gh-token\"\n\n[[workspaces]]\nname = \"personal\"\n",
+        );
+        add_repo_set(&path, "personal", "mine", &["a/r".into()]).expect("add");
+        add_repo_set(&path, "personal", "mine", &["c/r".into()]).expect("replace");
+        let config = read_file(&path).expect("read");
+        assert_eq!(config.workspaces[0].repo_sets.len(), 1);
+        assert_eq!(
+            config.workspaces[0].repo_sets[0].repos,
+            vec!["c/r".to_string()]
+        );
+    }
+
+    #[test]
+    fn editor_removes_repo_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = editor_config(
+            dir.path(),
+            "[github]\n\nauth_provider = \"gh-token\"\n\n[[workspaces]]\nname = \"personal\"\n",
+        );
+        add_repo_set(&path, "personal", "mine", &["a/r".into()]).expect("add");
+        remove_repo_set(&path, "personal", "mine").expect("remove");
+        let config = read_file(&path).expect("read");
+        assert!(config.workspaces[0].repo_sets.is_empty());
+    }
+
+    #[test]
+    fn editor_removes_single_repo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = editor_config(
+            dir.path(),
+            "[github]\n\nauth_provider = \"gh-token\"\n\n[[workspaces]]\nname = \"personal\"\n",
+        );
+        add_repo_set(&path, "personal", "mine", &["a/r".into(), "b/r".into()]).expect("add");
+        remove_repo(&path, "personal", "mine", "a/r").expect("remove");
+        let config = read_file(&path).expect("read");
+        assert_eq!(
+            config.workspaces[0].repo_sets[0].repos,
+            vec!["b/r".to_string()]
+        );
+    }
+
+    #[test]
+    fn editor_preserves_comments() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, CONFIG_TEMPLATE).expect("write template");
+        add_repo_set(&path, "personal", "mine", &["a/r".into()]).expect("add");
+        let raw = fs::read_to_string(&path).expect("read");
+        assert!(
+            raw.contains("# github-notifications configuration"),
+            "header comment kept"
+        );
+        assert!(
+            raw.contains("auto_dismiss_closed_merged"),
+            "example comment kept"
+        );
+        // And it still parses with the new repo set.
+        let config = read_file(&path).expect("read");
+        assert_eq!(
+            config.workspaces[0].repo_sets[0].repos,
+            vec!["a/r".to_string()]
+        );
     }
 }

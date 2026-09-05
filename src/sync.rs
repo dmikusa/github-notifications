@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -30,8 +30,9 @@ pub struct SyncEngine {
 impl SyncEngine {
     /// Spawn the background sync loop. Runs an initial full sync immediately,
     /// then refreshes on the configured poll interval; a manual sync can be
-    /// requested via [`SyncEngine::request_sync`].
-    pub fn spawn(client: Client, db: Arc<Database>, config: Arc<Config>) -> Self {
+    /// requested via [`SyncEngine::request_sync`]. The shared config is read
+    /// fresh each pass so UI-driven edits take effect without a restart.
+    pub fn spawn(client: Client, db: Arc<Database>, config: Arc<RwLock<Config>>) -> Self {
         let (trigger, mut rx) = mpsc::channel(8);
         let status = Arc::new(Mutex::new(SyncStatus::default()));
 
@@ -41,17 +42,21 @@ impl SyncEngine {
             let config = config.clone();
             let status = status.clone();
             tokio::spawn(async move {
-                run_sync(&client, &db, &config, &status, true).await;
-                let interval = Duration::from_secs(config.github.poll_interval_seconds.max(30));
+                let initial_config = config.read().expect("config lock poisoned").clone();
+                run_sync(&client, &db, &initial_config, &status, true).await;
+                let interval =
+                    Duration::from_secs(initial_config.github.poll_interval_seconds.max(30));
                 let mut ticker = tokio::time::interval(interval);
                 ticker.tick().await; // consume the immediate first tick
                 loop {
                     tokio::select! {
                         _ = ticker.tick() => {
-                            run_sync(&client, &db, &config, &status, false).await;
+                            let cfg = config.read().expect("config lock poisoned").clone();
+                            run_sync(&client, &db, &cfg, &status, false).await;
                         }
                         _ = rx.recv() => {
-                            run_sync(&client, &db, &config, &status, true).await;
+                            let cfg = config.read().expect("config lock poisoned").clone();
+                            run_sync(&client, &db, &cfg, &status, true).await;
                         }
                     }
                 }
@@ -238,10 +243,13 @@ async fn sync_repos(
                 break;
             }
             if response.status != axum::http::StatusCode::OK {
-                return Err(anyhow::anyhow!(
-                    "issues endpoint for {full_name} returned {}",
+                // A missing or inaccessible repo (404/403) shouldn't abort the
+                // whole sync; skip it and continue with the rest.
+                tracing::warn!(
+                    "skipping {full_name}: issues endpoint returned {}",
                     response.status
-                ));
+                );
+                break;
             }
 
             let issues: Vec<GithubIssue> = serde_json::from_slice(&response.body)
@@ -532,6 +540,10 @@ mod tests {
             .route(
                 "/notifications/threads/111",
                 patch(|| async { axum::http::StatusCode::RESET_CONTENT }),
+            )
+            .route(
+                "/repos/o/missing/issues",
+                get(|| async { axum::http::StatusCode::NOT_FOUND }),
             );
 
         tokio::spawn(async move {
@@ -579,5 +591,42 @@ mod tests {
         assert_eq!(db.count("threads").expect("count"), 2);
         // Auto-dismiss marks the merged PR thread read; the issue thread stays.
         assert_eq!(db.unread_thread_count().expect("unread"), 1);
+    }
+
+    #[tokio::test]
+    async fn sync_repos_skips_missing_repos() {
+        let base = mock_github().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("db");
+
+        let config = Config {
+            github: crate::config::GithubConfig {
+                auth_provider: crate::config::AuthProvider::Pat,
+                auth_token: "ghp_x".into(),
+                poll_interval_seconds: 60,
+                repo_refresh_interval_seconds: 60,
+                ..Default::default()
+            },
+            workspaces: vec![crate::config::Workspace {
+                name: "test".into(),
+                auto_dismiss_closed_merged: false,
+                repo_sets: vec![crate::config::RepoSet {
+                    name: "set".into(),
+                    repos: vec!["o/r".into(), "o/missing".into()],
+                }],
+            }],
+        };
+
+        let client = Client::with_base(
+            Arc::new(crate::auth::pat::ClassicPat::new("ghp_x".into())),
+            &base,
+        );
+        let status = Arc::new(Mutex::new(SyncStatus::default()));
+
+        // A missing repo (404) must not abort the sync; o/r is still cached.
+        let result = sync_once(&client, &db, &config, &status, true).await;
+        assert!(result.is_ok(), "sync failed: {:?}", result.err());
+        assert_eq!(db.count("issues").expect("count"), 2);
     }
 }

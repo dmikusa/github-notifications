@@ -22,7 +22,11 @@ window.App.notice = (() => {
     }
     el.hidden = false;
     el.classList.remove('error');
-    if (state.running) {
+    if (state.rebuild) {
+      el.textContent =
+        'Cache was rebuilt after a schema change \u2014 populating data from GitHub. ' +
+        'This can take a minute.';
+    } else if (state.running) {
       el.textContent =
         'Initial sync in progress \u2014 populating the cache from GitHub. ' +
         'This can take a minute on first run.';
@@ -50,6 +54,9 @@ window.App.views = (() => {
     const el = document.getElementById('view');
     el.outerHTML = html;
     window.App.table.bind();
+    if (view === 'settings') {
+      window.App.settings.bind();
+    }
   }
 
   async function reload() {

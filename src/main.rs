@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -91,10 +91,13 @@ async fn main() -> Result<()> {
     let addr = resolve_bind(cli.bind);
     tracing::info!("github-notifications listening on http://{addr}");
 
-    let engine = sync::SyncEngine::spawn(client.clone(), db.clone(), Arc::new(config.clone()));
+    let shared_config = Arc::new(RwLock::new(config.clone()));
+    let config_path = loaded.path;
+    let engine = sync::SyncEngine::spawn(client.clone(), db.clone(), shared_config.clone());
 
     let app = api::router(api::AppState {
-        config: Arc::new(config),
+        config: shared_config,
+        config_path,
         db,
         token,
         github: client,

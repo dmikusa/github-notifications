@@ -1,11 +1,12 @@
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Result;
 use axum::{
     extract::{Path, Query, State},
     http::{header, StatusCode, Uri},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -14,9 +15,10 @@ use tokio::sync::mpsc;
 use crate::{
     assets::{app_js, Assets},
     auth::TokenProvider,
-    config::{AuthProvider, Config, Workspace},
+    config::{self, AuthProvider, Config, Workspace},
     db::Database,
     github::{self, RateLimit, Validation},
+    models,
     sync::SyncStatus,
     views,
 };
@@ -24,7 +26,9 @@ use crate::{
 /// Shared application state handed to every handler.
 #[derive(Clone)]
 pub struct AppState {
-    pub config: Arc<Config>,
+    pub config: Arc<RwLock<Config>>,
+    /// Path of the config file, used for write-back.
+    pub config_path: PathBuf,
     pub db: Arc<Database>,
     pub token: Arc<dyn TokenProvider>,
     pub github: github::Client,
@@ -46,11 +50,23 @@ pub fn router(state: AppState) -> Router {
         .route("/api/views/queue", get(queue_view))
         .route("/api/views/inbox", get(inbox_view))
         .route("/api/views/repos", get(repos_view))
+        .route("/api/views/settings", get(settings_view))
         .route("/api/threads/mark-read", post(threads_mark_read))
         .route("/api/issues/mark-read", post(issues_mark_read))
         .route("/api/threads/mute", post(thread_mute))
         .route("/api/repos/{owner}/{repo}/watch", post(repo_watch))
         .route("/api/repos/{owner}/{repo}/unwatch", post(repo_unwatch))
+        .route("/api/workspaces/{name}/repo-sets", get(workspace_repo_sets))
+        .route("/api/workspaces/{name}/repo-sets", post(repo_set_create))
+        .route(
+            "/api/workspaces/{name}/repo-sets/{set}",
+            delete(repo_set_delete),
+        )
+        .route(
+            "/api/workspaces/{name}/repo-sets/{set}/repos/{repo}",
+            delete(repo_delete),
+        )
+        .route("/api/orgs/{org}/repos", get(org_repos))
         .fallback(static_handler)
         .with_state(state)
 }
@@ -95,7 +111,10 @@ struct SyncState {
 }
 
 async fn state_handler(State(state): State<AppState>) -> Response {
-    let config = state.config.as_ref();
+    let (workspaces, provider) = {
+        let config = state.config.read().expect("config lock poisoned");
+        (config.workspaces.clone(), config.github.auth_provider)
+    };
     let last_sync_db = state.db.get_sync_state("last_sync").unwrap_or_default();
 
     // Resolving the token may run the OAuth device flow on first use.
@@ -130,7 +149,7 @@ async fn state_handler(State(state): State<AppState>) -> Response {
     };
 
     let auth = AuthState {
-        provider: provider_name(config.github.auth_provider).to_string(),
+        provider: provider_name(provider).to_string(),
         authenticated,
         login: validation.as_ref().and_then(|v| v.login.clone()),
         scopes: validation
@@ -146,7 +165,7 @@ async fn state_handler(State(state): State<AppState>) -> Response {
 
     let response = StateResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        workspaces: config.workspaces.clone(),
+        workspaces,
         auth,
         sync,
     };
@@ -193,7 +212,8 @@ async fn queue_view(
     State(state): State<AppState>,
     Query(params): Query<views::QueueParams>,
 ) -> Response {
-    let ws = views::resolve_workspace(&state.config, &params.ws);
+    let config = state.config.read().expect("config lock poisoned");
+    let ws = views::resolve_workspace(&config, &params.ws);
     match views::render_queue(&state.db, ws, &params) {
         Ok(html) => html_response(html),
         Err(e) => json_response(Err::<(), _>(e)),
@@ -204,7 +224,8 @@ async fn inbox_view(
     State(state): State<AppState>,
     Query(params): Query<views::InboxParams>,
 ) -> Response {
-    let ws = views::resolve_workspace(&state.config, &params.ws);
+    let config = state.config.read().expect("config lock poisoned");
+    let ws = views::resolve_workspace(&config, &params.ws);
     match views::render_inbox(&state.db, ws, &params) {
         Ok(html) => html_response(html),
         Err(e) => json_response(Err::<(), _>(e)),
@@ -215,8 +236,21 @@ async fn repos_view(
     State(state): State<AppState>,
     Query(params): Query<views::RepoParams>,
 ) -> Response {
-    let ws = views::resolve_workspace(&state.config, &params.ws);
+    let config = state.config.read().expect("config lock poisoned");
+    let ws = views::resolve_workspace(&config, &params.ws);
     match views::render_repos(&state.db, ws, &params) {
+        Ok(html) => html_response(html),
+        Err(e) => json_response(Err::<(), _>(e)),
+    }
+}
+
+async fn settings_view(
+    State(state): State<AppState>,
+    Query(params): Query<views::RepoParams>,
+) -> Response {
+    let config = state.config.read().expect("config lock poisoned");
+    let ws = views::resolve_workspace(&config, &params.ws);
+    match views::render_settings(ws) {
         Ok(html) => html_response(html),
         Err(e) => json_response(Err::<(), _>(e)),
     }
@@ -229,6 +263,8 @@ struct SyncStatusResponse {
     running: bool,
     last_sync: Option<String>,
     last_error: Option<String>,
+    /// Set when the cache was rebuilt (e.g. after a schema change).
+    rebuild: Option<String>,
 }
 
 async fn sync_status_handler(State(state): State<AppState>) -> Response {
@@ -248,6 +284,7 @@ async fn sync_status_handler(State(state): State<AppState>) -> Response {
         running: status.running,
         last_sync: status.last_sync,
         last_error: status.last_error,
+        rebuild: state.db.get_sync_state("last_rebuild").unwrap_or_default(),
     };
     (
         [(header::CONTENT_TYPE, "application/json")],
@@ -269,12 +306,15 @@ async fn threads_mark_read(
 ) -> Response {
     let result = async {
         if body.all == Some(true) {
-            let ws = views::resolve_workspace(&state.config, body.ws.as_deref().unwrap_or(""));
+            let ws = {
+                let config = state.config.read().expect("config lock poisoned");
+                let ws = views::resolve_workspace(&config, body.ws.as_deref().unwrap_or(""));
+                ws.tracked_repos()
+            };
             let res = state.github.put("/notifications").await?;
             ensure_success(&res.status, "mark all notifications read")?;
-            let repos = ws.tracked_repos();
-            state.db.set_unread_for_repos(&repos, false)?;
-            return Ok::<usize, anyhow::Error>(repos.len());
+            state.db.set_unread_for_repos(&ws, false)?;
+            return Ok::<usize, anyhow::Error>(ws.len());
         }
         let ids = body.ids.unwrap_or_default();
         mark_threads_read(&state, &ids).await
@@ -367,6 +407,140 @@ async fn repo_unwatch(
     json_response(result)
 }
 
+#[derive(Serialize)]
+struct RepoSetInfo {
+    name: String,
+    repos: Vec<String>,
+}
+
+async fn workspace_repo_sets(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    let result = async {
+        let config = state.config.read().expect("config lock poisoned");
+        let ws = views::resolve_workspace(&config, &name);
+        let sets = ws
+            .repo_sets
+            .iter()
+            .map(|s| RepoSetInfo {
+                name: s.name.clone(),
+                repos: s.repos.clone(),
+            })
+            .collect::<Vec<_>>();
+        Ok::<_, anyhow::Error>(sets)
+    }
+    .await;
+    json_response(result)
+}
+
+#[derive(Deserialize)]
+struct RepoSetBody {
+    name: String,
+    #[serde(default)]
+    repos: Vec<String>,
+}
+
+async fn repo_set_create(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<RepoSetBody>,
+) -> Response {
+    let result = async {
+        config::add_repo_set(&state.config_path, &name, &body.name, &body.repos)?;
+        reload_config(&state)?;
+        let _ = state.sync_trigger.send(()).await;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    json_response(result)
+}
+
+async fn repo_set_delete(
+    State(state): State<AppState>,
+    Path((name, set)): Path<(String, String)>,
+) -> Response {
+    let result = async {
+        config::remove_repo_set(&state.config_path, &name, &set)?;
+        reload_config(&state)?;
+        let _ = state.sync_trigger.send(()).await;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    json_response(result)
+}
+
+async fn repo_delete(
+    State(state): State<AppState>,
+    Path((name, set, repo)): Path<(String, String, String)>,
+) -> Response {
+    let result = async {
+        config::remove_repo(&state.config_path, &name, &set, &repo)?;
+        reload_config(&state)?;
+        let _ = state.sync_trigger.send(()).await;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    json_response(result)
+}
+
+#[derive(Deserialize)]
+struct OrgReposParams {
+    page: Option<u32>,
+    q: Option<String>,
+}
+
+#[derive(Serialize)]
+struct OrgRepo {
+    full_name: String,
+    html_url: String,
+}
+
+#[derive(Serialize)]
+struct OrgReposResponse {
+    repos: Vec<OrgRepo>,
+    has_more: bool,
+}
+
+async fn org_repos(
+    State(state): State<AppState>,
+    Path(org): Path<String>,
+    Query(params): Query<OrgReposParams>,
+) -> Response {
+    let result = async {
+        let page = params.page.unwrap_or(1).max(1);
+        let page_str = page.to_string();
+        let res = state
+            .github
+            .get(
+                &format!("/orgs/{org}/repos"),
+                &[("per_page", "100"), ("page", page_str.as_str())],
+                None,
+            )
+            .await?;
+        ensure_success(&res.status, "list org repos")?;
+        let repos: Vec<models::WatchedRepo> = serde_json::from_slice(&res.body)?;
+        let has_more = github::has_next(&res.headers);
+        let q = params.q.unwrap_or_default();
+        let repos = repos
+            .into_iter()
+            .filter(|r| q.is_empty() || r.full_name.contains(&q))
+            .map(|r| OrgRepo {
+                full_name: r.full_name,
+                html_url: r.html_url,
+            })
+            .collect();
+        Ok::<_, anyhow::Error>(OrgReposResponse { repos, has_more })
+    }
+    .await;
+    json_response(result)
+}
+
+/// Reload the in-memory config from disk after a write-back so UI edits take
+/// effect without a restart.
+fn reload_config(state: &AppState) -> Result<()> {
+    let config = config::read_file(&state.config_path)?;
+    *state.config.write().expect("config lock poisoned") = config;
+    Ok(())
+}
+
 /// Mark a set of threads read on GitHub and locally. Returns the count marked.
 async fn mark_threads_read(state: &AppState, thread_ids: &[String]) -> Result<usize> {
     let mut count = 0;
@@ -453,7 +627,8 @@ mod tests {
         let token: Arc<dyn TokenProvider> = Arc::new(ClassicPat::new("ghp_test".into()));
         let (sync_trigger, _rx) = tokio::sync::mpsc::channel(8);
         AppState {
-            config: Arc::new(config),
+            config: Arc::new(RwLock::new(config)),
+            config_path: dir.path().join("config.toml"),
             db: Arc::new(db),
             github: github::Client::new(token.clone()),
             token,
@@ -544,6 +719,7 @@ mod tests {
     }
 
     fn state_with_client(db: Arc<Database>, client: github::Client) -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir");
         let config = Config {
             github: GithubConfig {
                 auth_provider: AuthProvider::Pat,
@@ -562,7 +738,8 @@ mod tests {
         let token: Arc<dyn TokenProvider> = Arc::new(ClassicPat::new("ghp_test".into()));
         let (sync_trigger, _rx) = tokio::sync::mpsc::channel(8);
         AppState {
-            config: Arc::new(config),
+            config: Arc::new(RwLock::new(config)),
+            config_path: dir.path().join("config.toml"),
             db,
             github: client,
             token,
@@ -731,5 +908,173 @@ mod tests {
             .expect("watched")
         });
         assert_eq!(watched, 0);
+    }
+
+    fn state_with_config_file(body: &str) -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, body).expect("write config");
+        let config = config::read_file(&config_path).expect("read config");
+        let db = Arc::new(Database::open(&dir.path().join("data.db")).expect("db"));
+        let token: Arc<dyn TokenProvider> = Arc::new(ClassicPat::new("ghp_test".into()));
+        let (sync_trigger, _rx) = tokio::sync::mpsc::channel(8);
+        let state = AppState {
+            config: Arc::new(RwLock::new(config)),
+            config_path,
+            db,
+            github: github::Client::new(token.clone()),
+            token,
+            validation: Arc::new(Mutex::new(None)),
+            sync_status: Arc::new(Mutex::new(SyncStatus::default())),
+            sync_trigger,
+        };
+        (state, dir)
+    }
+
+    #[tokio::test]
+    async fn repo_set_endpoints_update_config() {
+        let (state, _dir) = state_with_config_file(
+            "[github]\nauth_provider = \"gh-token\"\n\n[[workspaces]]\nname = \"personal\"\n",
+        );
+        let app = router(state.clone());
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/workspaces/personal/repo-sets")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"mine","repos":["a/r","b/r"]}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Config file was updated, comments aside.
+        let raw = std::fs::read_to_string(&state.config_path).expect("read config");
+        assert!(raw.contains("a/r"));
+
+        // In-memory shared config was reloaded.
+        {
+            let cfg = state.config.read().expect("lock");
+            assert_eq!(cfg.workspaces[0].repo_sets[0].name, "mine");
+            assert_eq!(
+                cfg.workspaces[0].repo_sets[0].repos,
+                vec!["a/r".to_string(), "b/r".to_string()]
+            );
+        }
+
+        // The list endpoint reflects it.
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/workspaces/personal/repo-sets")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("mine"));
+        assert!(body.contains("a/r"));
+    }
+
+    #[tokio::test]
+    async fn repo_set_delete_updates_config() {
+        let (state, _dir) = state_with_config_file(
+            "[github]\nauth_provider = \"gh-token\"\n\n[[workspaces]]\nname = \"personal\"\n",
+        );
+        let app = router(state.clone());
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/workspaces/personal/repo-sets")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"mine","repos":["a/r"]}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/api/workspaces/personal/repo-sets/mine")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::OK);
+        let cfg = state.config.read().expect("lock");
+        assert!(cfg.workspaces[0].repo_sets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn org_repos_browses_and_filters() {
+        use axum::routing::get;
+
+        let app = Router::new().route(
+            "/orgs/o/repos",
+            get(|| async {
+                (
+                    [(
+                        "link",
+                        "<https://api.github.com/orgs/o/repos?page=2>; rel=\"next\"",
+                    )],
+                    r#"[
+                        {"full_name":"o/repo-a","html_url":"https://github.com/o/repo-a"},
+                        {"full_name":"o/repo-b","html_url":"https://github.com/o/repo-b"}
+                    ]"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(Database::open(&dir.path().join("data.db")).expect("db"));
+        let client = github::Client::with_base(Arc::new(ClassicPat::new("ghp_x".into())), &base);
+        let app = router(state_with_client(db, client));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/orgs/o/repos?q=repo-a")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("o/repo-a"));
+        assert!(!body.contains("o/repo-b"));
+        assert!(body.contains("\"has_more\":true"));
     }
 }
