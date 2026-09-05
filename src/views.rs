@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use anyhow::{Context, Result};
 use askama::Template;
 
-use crate::config::{Config, Workspace};
+use crate::config::{Config, RepoSet, Workspace};
 use crate::db::{self, Database};
 
 /// The workspace shown when the config has no workspaces yet.
@@ -125,6 +125,22 @@ pub fn render_repos(db: &Database, workspace: &Workspace, q: &RepoParams) -> Res
         items: &items,
     };
     template.render().context("rendering repos view")
+}
+
+#[derive(Template)]
+#[template(path = "settings.html")]
+struct SettingsTemplate<'a> {
+    ws: &'a str,
+    repo_sets: &'a [RepoSet],
+}
+
+/// Render the settings view fragment (repo set management) for `workspace`.
+pub fn render_settings(workspace: &Workspace) -> Result<String> {
+    let template = SettingsTemplate {
+        ws: &workspace.name,
+        repo_sets: &workspace.repo_sets,
+    };
+    template.render().context("rendering settings view")
 }
 
 /// Query params for the queue view.

@@ -192,6 +192,16 @@ closed and merged. Queue items are unaffected (they follow GitHub state).
 - JS modules are concatenated in dependency order (`src/assets.rs::JS_BUNDLE`).
 - Each JS file carries a `// js/<path>:` header that tests verify.
 
+### Config write-back
+
+The config is held in memory as a shared `Arc<RwLock<Config>>` so UI edits take
+effect without a restart; the sync engine reads it fresh each pass. Repo set
+changes are written to `config.toml` with `toml_edit`, which preserves the
+commented template the file was created from. Mutations (add/remove repo set,
+remove repo) reload the shared config and trigger a sync. A 404/403 on an
+individual repo's issues endpoint is skipped with a warning rather than
+aborting the whole sync.
+
 ### Database migrations — self-healing rebuild
 
 The SQLite cache is **fully derived from the GitHub API**; all user intent
@@ -308,5 +318,5 @@ with the human before proceeding.
 - [x] Phase 1 — Auth
 - [x] Phase 2 — Sync engine
 - [x] Phase 3 — UI
-- [ ] Phase 4 — Extras
+- [x] Phase 4 — Extras
 - [ ] Phase 5 — Distribution

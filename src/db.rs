@@ -100,13 +100,47 @@ pub struct RepoFilter<'a> {
     pub search: Option<&'a str>,
 }
 
+/// Current schema version. Bump whenever the SQLite schema changes; the
+/// database is rebuilt (backed up and recreated) on mismatch.
+pub const SCHEMA_VERSION: i64 = 1;
+
 impl Database {
-    /// Open (creating if needed) the database at `path` and initialize the schema.
+    /// Open (creating if needed) the database at `path` and initialize the
+    /// schema.
+    ///
+    /// On a schema-version mismatch the existing database is backed up to
+    /// `<name>.bak` and recreated fresh. The cache is fully derived from the
+    /// GitHub API, so a rebuild is cheap and the only cost is one full sync.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating data directory {}", parent.display()))?;
         }
+
+        let existed = path.exists();
+        let conn = Connection::open(path)
+            .with_context(|| format!("opening database {}", path.display()))?;
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .context("reading schema version")?;
+
+        if version != SCHEMA_VERSION && existed {
+            tracing::warn!(
+                "database schema version {version} != expected {SCHEMA_VERSION}; backing up and rebuilding the cache"
+            );
+            drop(conn);
+            backup_database(path)?;
+            let db = Self::open_fresh(path)?;
+            db.set_sync_state("last_rebuild", &now_rfc3339())?;
+            return Ok(db);
+        }
+
+        drop(conn);
+        let db = Self::open_fresh(path)?;
+        Ok(db)
+    }
+
+    fn open_fresh(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)
             .with_context(|| format!("opening database {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")
@@ -117,6 +151,11 @@ impl Database {
             conn: Mutex::new(conn),
         };
         db.init_schema()?;
+        {
+            let conn = db.conn.lock().expect("db lock poisoned");
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+                .context("setting schema version")?;
+        }
         Ok(db)
     }
 
@@ -680,6 +719,34 @@ fn split_repo(full_name: &str) -> (&str, &str) {
     }
 }
 
+/// Rename the database and its WAL/SHM side files to `<name>.bak` before a
+/// rebuild. Side-file moves are best-effort; the main file must succeed.
+fn backup_database(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let bak = with_suffix(path, ".bak");
+    std::fs::rename(path, &bak)
+        .with_context(|| format!("backing up {} to {}", path.display(), bak.display()))?;
+    for suffix in ["-wal", "-shm"] {
+        let side = with_suffix(path, suffix);
+        if side.exists() {
+            let _ = std::fs::rename(&side, with_suffix(path, &format!("{suffix}.bak")));
+        }
+    }
+    Ok(())
+}
+
+/// `path` with `suffix` appended to the file name.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    PathBuf::from(format!("{}{suffix}", path.display()))
+}
+
+/// Current UTC time in RFC3339 with milliseconds.
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
 /// Convert a subject API url (e.g. `https://api.github.com/repos/o/r/pulls/7`)
 /// into the corresponding github.com HTML url.
 fn subject_html_url(api: Option<&str>) -> Option<String> {
@@ -748,5 +815,61 @@ mod tests {
                 "missing table {expected}"
             );
         }
+    }
+
+    #[test]
+    fn fresh_and_matching_db_do_not_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("data.db");
+        let db = Database::open(&path).expect("open");
+        db.set_sync_state("last_sync", "2026-01-01T00:00:00Z")
+            .expect("set");
+        drop(db);
+        assert!(!path.with_file_name("data.db.bak").exists());
+
+        // Reopen at the same version: still no backup.
+        let db = Database::open(&path).expect("reopen");
+        assert_eq!(
+            db.get_sync_state("last_sync").expect("get").as_deref(),
+            Some("2026-01-01T00:00:00Z")
+        );
+        drop(db);
+        assert!(!path.with_file_name("data.db.bak").exists());
+    }
+
+    #[test]
+    fn rebuilds_on_schema_mismatch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("data.db");
+        let db = Database::open(&path).expect("open");
+        db.set_sync_state("last_sync", "old-value").expect("set");
+        // Simulate an incompatible future/older schema.
+        db.with_conn(|c| {
+            c.pragma_update(None, "user_version", 99)
+                .expect("bump version")
+        });
+        drop(db);
+
+        let db = Database::open(&path).expect("reopen after rebuild");
+        assert!(
+            path.with_file_name("data.db.bak").exists(),
+            "expected a backup"
+        );
+        assert_eq!(
+            db.get_sync_state("last_sync").expect("get"),
+            None,
+            "old data dropped"
+        );
+        assert!(
+            db.get_sync_state("last_rebuild").expect("get").is_some(),
+            "rebuild should be recorded"
+        );
+        assert_eq!(
+            db.with_conn(|c| {
+                c.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                    .expect("version")
+            }),
+            SCHEMA_VERSION
+        );
     }
 }
