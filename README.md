@@ -36,7 +36,7 @@ sets.
 
 ```console
 $ cargo build
-$ cargo run -- --bind 127.0.0.1:8080 --open
+$ cargo run -- --bind 127.0.0.1:8080   # opens the browser automatically
 $ cargo test
 ```
 

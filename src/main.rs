@@ -22,9 +22,9 @@ struct Cli {
     #[arg(long)]
     bind: Option<SocketAddr>,
 
-    /// Open the web UI in the default browser after starting
+    /// Do not open the web UI in the default browser after starting
     #[arg(long)]
-    open: bool,
+    no_open: bool,
 }
 
 #[tokio::main]
@@ -91,10 +91,6 @@ async fn main() -> Result<()> {
     let addr = resolve_bind(cli.bind);
     tracing::info!("github-notifications listening on http://{addr}");
 
-    if cli.open {
-        util::open_browser(&format!("http://{addr}"));
-    }
-
     let engine = sync::SyncEngine::spawn(client.clone(), db.clone(), Arc::new(config.clone()));
 
     let app = api::router(api::AppState {
@@ -110,8 +106,25 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding HTTP server to {addr}"))?;
+
+    // Open the browser only once the server is actually listening. Skip when
+    // the user opted out or the server is bound beyond loopback (e.g. in a
+    // container, where there is no local browser to open).
+    if should_open_browser(cli.no_open, addr) {
+        util::open_browser(&format!("http://{addr}"));
+    }
+
     axum::serve(listener, app).await.context("serving HTTP")?;
     Ok(())
+}
+
+/// Whether to auto-open the browser: opt-out flag wins, and we never open one
+/// for a non-loopback bind (containers/remote hosts).
+fn should_open_browser(no_open: bool, addr: SocketAddr) -> bool {
+    if no_open {
+        return false;
+    }
+    addr.ip().is_loopback()
 }
 
 /// Determine the listen address: explicit `--bind`, then `$HOST:$PORT`
@@ -189,5 +202,23 @@ mod tests {
             resolve_bind_with_env(None, None, None),
             SocketAddr::from(([127, 0, 0, 1], 8080))
         );
+    }
+
+    #[test]
+    fn opens_browser_by_default_on_loopback() {
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert!(should_open_browser(false, addr));
+    }
+
+    #[test]
+    fn no_open_disables_browser() {
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert!(!should_open_browser(true, addr));
+    }
+
+    #[test]
+    fn never_opens_browser_for_non_loopback() {
+        let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        assert!(!should_open_browser(false, addr));
     }
 }
