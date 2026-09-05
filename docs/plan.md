@@ -164,7 +164,7 @@ PATs; empirical testing confirmed OAuth app tokens with `repo` scope also work
 3. **OAuth device flow** (`oauth-device`) — browser authorize flow, stores the
    token locally; useful without gh installed.
 
-Setup steps and scope requirements are documented in `SETUP.md`.
+Setup steps and scope requirements are documented in `docs/setup.md`.
 
 ### Sync all workspaces, dedupe
 
@@ -192,6 +192,35 @@ closed and merged. Queue items are unaffected (they follow GitHub state).
 - JS modules are concatenated in dependency order (`src/assets.rs::JS_BUNDLE`).
 - Each JS file carries a `// js/<path>:` header that tests verify.
 
+### Database migrations — self-healing rebuild
+
+The SQLite cache is **fully derived from the GitHub API**; all user intent
+(workspaces, repo sets, credentials) lives in `config.toml`. There is no
+hand-authored data in the database, so rebuilding it is cheap (~one full sync,
+seconds to a minute, well within rate limits). The only thing lost on a rebuild
+is the ETag/sync-position cache, which costs one full fetch to repopulate.
+
+Rather than maintaining forward migration scripts, the app uses a
+**self-healing rebuild** on schema mismatch:
+
+1. On startup, `Database::open` compares the expected schema version against
+   the stored `PRAGMA user_version`.
+2. If they differ (or the schema is missing), the old database is **renamed to
+   `data.db.bak`** (including WAL/SHM side files) and a fresh database is
+   created with the current schema.
+3. The normal initial sync then repopulates the cache from GitHub.
+
+**User visibility:** the rebuild must not look like a hang. The daemon logs
+what it is doing, and the rebuild is recorded (e.g. in `sync_state`) and
+surfaced to the UI (status line / `/api/state`) so the user sees
+"cache rebuilt from the previous version; resyncing" rather than a silent wait.
+If a rebuild fails for any reason, the app reports the error and stops cleanly
+instead of crash-looping.
+
+This is preferred over hand-written `ALTER TABLE` migrations (Option B): it
+never "unexpectedly fails" mid-upgrade, requires no migration-authoring
+discipline, and matches the fact that the data is disposable.
+
 ## API Surface (localhost)
 
 - `GET /api/state` — version, workspaces, auth status, sync status.
@@ -216,7 +245,7 @@ with the human before proceeding.
 - Cargo project: config loading (TOML), SQLite schema, embedded UI,
   `/api/state`, static serving + JS concat.
 - Container-friendly env handling (`PORT`, `GHNOTIFY_DATA_DIR`, `GITHUB_TOKEN`).
-- Docs: `docs/plan.md`, `docs/architecture.md`, `SETUP.md`.
+- Docs: `docs/plan.md`, `docs/architecture.md`, `docs/setup.md`.
 - CI: `cargo fmt`/`clippy`/`test` on PR + zizmor job.
 - Renovate config + workflow.
 - cargo-dist init (workflow, installers, targets).

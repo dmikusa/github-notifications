@@ -26,7 +26,7 @@ $ github-notifications
 # then serves the UI at http://127.0.0.1:8080
 ```
 
-Follow [docs/SETUP.md](docs/SETUP.md) to configure GitHub authentication
+Follow [docs/setup.md](docs/setup.md) to configure GitHub authentication
 (classic PAT, gh-token reuse, or OAuth device flow) and add workspaces/repo
 sets.
 
