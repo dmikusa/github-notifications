@@ -507,26 +507,53 @@ async fn org_repos(
     let result = async {
         let page = params.page.unwrap_or(1).max(1);
         let page_str = page.to_string();
-        let res = state
-            .github
-            .get(
-                &format!("/orgs/{org}/repos"),
-                &[("per_page", "100"), ("page", page_str.as_str())],
-                None,
-            )
-            .await?;
-        ensure_success(&res.status, "list org repos")?;
-        let repos: Vec<models::WatchedRepo> = serde_json::from_slice(&res.body)?;
-        let has_more = github::has_next(&res.headers);
         let q = params.q.unwrap_or_default();
-        let repos = repos
+
+        let (raw_repos, has_more) = if q.is_empty() {
+            let res = state
+                .github
+                .get(
+                    &format!("/orgs/{org}/repos"),
+                    &[("per_page", "100"), ("page", page_str.as_str())],
+                    None,
+                )
+                .await?;
+            ensure_success(&res.status, "list org repos")?;
+            let repos: Vec<models::WatchedRepo> = serde_json::from_slice(&res.body)?;
+            (repos, github::has_next(&res.headers))
+        } else {
+            // Search across the whole org by name (the plain org endpoint has
+            // no server-side filter and only pages a fixed slice).
+            #[derive(Deserialize)]
+            struct SearchResult {
+                items: Vec<models::WatchedRepo>,
+            }
+            let query = format!("org:{org} {q} in:name");
+            let res = state
+                .github
+                .get(
+                    "/search/repositories",
+                    &[
+                        ("q", query.as_str()),
+                        ("per_page", "100"),
+                        ("page", page_str.as_str()),
+                    ],
+                    None,
+                )
+                .await?;
+            ensure_success(&res.status, "search org repos")?;
+            let parsed: SearchResult = serde_json::from_slice(&res.body)?;
+            (parsed.items, github::has_next(&res.headers))
+        };
+
+        let mut repos: Vec<OrgRepo> = raw_repos
             .into_iter()
-            .filter(|r| q.is_empty() || r.full_name.contains(&q))
             .map(|r| OrgRepo {
                 full_name: r.full_name,
                 html_url: r.html_url,
             })
             .collect();
+        repos.sort_by(|a, b| a.full_name.cmp(&b.full_name));
         Ok::<_, anyhow::Error>(OrgReposResponse { repos, has_more })
     }
     .await;
@@ -1025,24 +1052,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn org_repos_browses_and_filters() {
+    async fn org_repos_sorts_and_searches() {
         use axum::routing::get;
 
-        let app = Router::new().route(
-            "/orgs/o/repos",
-            get(|| async {
-                (
-                    [(
-                        "link",
-                        "<https://api.github.com/orgs/o/repos?page=2>; rel=\"next\"",
-                    )],
-                    r#"[
-                        {"full_name":"o/repo-a","html_url":"https://github.com/o/repo-a"},
-                        {"full_name":"o/repo-b","html_url":"https://github.com/o/repo-b"}
+        let app = Router::new()
+            .route(
+                "/orgs/o/repos",
+                get(|| async {
+                    // Deliberately unsorted; the handler must sort by name.
+                    (
+                        [(
+                            "link",
+                            "<https://api.github.com/orgs/o/repos?page=2>; rel=\"next\"",
+                        )],
+                        r#"[
+                        {"full_name":"o/repo-b","html_url":"https://github.com/o/repo-b"},
+                        {"full_name":"o/repo-a","html_url":"https://github.com/o/repo-a"}
                     ]"#,
-                )
-            }),
-        );
+                    )
+                }),
+            )
+            .route(
+                "/search/repositories",
+                get(|| async {
+                    (
+                        [(
+                            "link",
+                            "<https://api.github.com/search/repositories?page=2>; rel=\"next\"",
+                        )],
+                        r#"{"total_count":1,"items":[{"full_name":"o/repo-a","html_url":"https://github.com/o/repo-a"}]}"#,
+                    )
+                }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -1056,6 +1097,31 @@ mod tests {
         let client = github::Client::with_base(Arc::new(ClassicPat::new("ghp_x".into())), &base);
         let app = router(state_with_client(db, client));
 
+        // Without a query: sorted by name.
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/orgs/o/repos")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        let a = body.find("o/repo-a").expect("repo-a present");
+        let b = body.find("o/repo-b").expect("repo-b present");
+        assert!(a < b, "repos should be sorted alphabetically");
+        assert!(body.contains("\"has_more\":true"));
+
+        // With a query: hits the search endpoint.
         let response = app
             .oneshot(
                 axum::http::Request::builder()

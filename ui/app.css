@@ -348,6 +348,13 @@ button.primary {
   cursor: pointer;
 }
 
+.actions {
+  margin-top: 0.75rem;
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
 .bulk-bar .sel-count {
   color: var(--muted);
   font-size: 12px;

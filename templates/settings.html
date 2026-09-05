@@ -28,13 +28,13 @@
   <form id="org-picker" class="filters">
     <input type="text" name="set-name" placeholder="Repo set name" required>
     <input type="text" name="org" placeholder="GitHub org, e.g. paketo-buildpacks" required>
-    <button type="submit">Load repos</button>
+    <button type="submit" id="load-repos">Load repos</button>
   </form>
 
   <div id="org-repos" hidden>
-    <input type="search" id="org-filter" placeholder="Filter loaded repos">
+    <input type="search" id="org-filter" placeholder="Filter repos by name">
     <div id="org-repo-list" class="repo-list"></div>
-    <div class="bulk-bar">
+    <div class="actions">
       <button id="load-more" hidden>Load more</button>
       <button id="save-set" class="primary">Save repo set</button>
     </div>
