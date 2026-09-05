@@ -404,7 +404,7 @@ fn tracked_repos(config: &Config) -> Vec<String> {
 }
 
 /// Whether the stored timestamp (RFC3339) is older than `interval_seconds`.
-fn due(last: &Option<String>, interval_seconds: u64) -> bool {
+pub fn due(last: &Option<String>, interval_seconds: u64) -> bool {
     match last {
         None => true,
         Some(raw) => {

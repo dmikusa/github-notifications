@@ -102,7 +102,7 @@ pub struct RepoFilter<'a> {
 
 /// Current schema version. Bump whenever the SQLite schema changes; the
 /// database is rebuilt (backed up and recreated) on mismatch.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 impl Database {
     /// Open (creating if needed) the database at `path` and initialize the
@@ -210,6 +210,13 @@ CREATE TABLE IF NOT EXISTS sync_state (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+CREATE TABLE IF NOT EXISTS org_repos (
+    org       TEXT NOT NULL,
+    full_name TEXT NOT NULL,
+    html_url  TEXT,
+    PRIMARY KEY (org, full_name)
+);
 "#,
         )
         .context("initializing database schema")?;
@@ -257,6 +264,56 @@ CREATE TABLE IF NOT EXISTS sync_state (
             )
             .context("upserting repo")?;
         Ok(id)
+    }
+
+    /// Replace the cached repo list for an org. The org browser's repo list is
+    /// the same for every workspace (it's the org's repos on GitHub), so it is
+    /// cached once globally and shared across workspaces.
+    pub fn replace_org_repos(&self, org: &str, repos: &[crate::models::WatchedRepo]) -> Result<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let tx = conn
+            .unchecked_transaction()
+            .context("starting org repo replace")?;
+        tx.execute("DELETE FROM org_repos WHERE org = ?1", params![org])
+            .context("clearing org repos")?;
+        {
+            let mut stmt = tx
+                .prepare("INSERT INTO org_repos (org, full_name, html_url) VALUES (?1, ?2, ?3)")
+                .context("preparing org repo insert")?;
+            for repo in repos {
+                stmt.execute(params![org, repo.full_name, repo.html_url])
+                    .context("inserting org repo")?;
+            }
+        }
+        tx.commit().context("committing org repos")
+    }
+
+    /// List the cached repos for an org, optionally filtered by a case-insensitive
+    /// name search. Sorted by full name.
+    pub fn list_org_repos(
+        &self,
+        org: &str,
+        search: &str,
+    ) -> Result<Vec<crate::models::WatchedRepo>> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let mut sql = String::from("SELECT full_name, html_url FROM org_repos WHERE org = ?1");
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(org.to_string())];
+        if !search.is_empty() {
+            sql.push_str(" AND full_name LIKE ?2");
+            params.push(Box::new(format!("%{search}%")));
+        }
+        sql.push_str(" ORDER BY full_name");
+        let mut stmt = conn.prepare(&sql).context("preparing org repo query")?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok(crate::models::WatchedRepo {
+                    full_name: row.get(0)?,
+                    html_url: row.get(1)?,
+                })
+            })
+            .context("querying org repos")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("reading org repos")
     }
 
     /// Upsert an issue or pull request belonging to `repo_id`.
@@ -474,7 +531,7 @@ CREATE TABLE IF NOT EXISTS sync_state (
             "repo" => "ORDER BY r.full_name, i.number DESC",
             _ => "ORDER BY COALESCE(thread_updated, i.updated_at) DESC",
         };
-        sql.push_str(order);
+        sql.push_str(&format!(" {order}"));
 
         let mut stmt = conn.prepare(&sql).context("preparing queue query")?;
         let rows = stmt
@@ -529,7 +586,7 @@ CREATE TABLE IF NOT EXISTS sync_state (
             "repo" => "ORDER BY r.full_name, t.updated_at DESC",
             _ => "ORDER BY t.updated_at DESC",
         };
-        sql.push_str(order);
+        sql.push_str(&format!(" {order}"));
 
         let mut stmt = conn.prepare(&sql).context("preparing inbox query")?;
         let rows = stmt
@@ -871,5 +928,62 @@ mod tests {
             }),
             SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn inbox_filters_do_not_produce_malformed_sql() {
+        // Regression: `list_inbox` with `unread_only` builds
+        // `... AND t.unread = 1ORDER BY ...` (missing space) which SQLite
+        // rejects, so the "Unread only" inbox filter 500'd when it was the
+        // last clause in the query.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("open");
+
+        let with_filter = |repos: &[String], unread_only: bool| {
+            db.list_inbox(&InboxFilter {
+                repos,
+                subject_type: None,
+                reason: None,
+                unread_only,
+                sort: "updated",
+            })
+        };
+
+        // Empty repo list + unread_only was the crashing combination.
+        assert!(with_filter(&[], true).is_ok());
+        assert!(with_filter(&[], false).is_ok());
+        assert!(with_filter(&["o/r".into()], true).is_ok());
+    }
+
+    #[test]
+    fn org_repos_cache_is_per_org_and_searchable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("open");
+        let repo = |n: &str| crate::models::WatchedRepo {
+            full_name: format!("o/{n}"),
+            html_url: format!("https://github.com/o/{n}"),
+        };
+        let a = repo("repo-a");
+        let b = repo("repo-b");
+
+        db.replace_org_repos("o", &[b, a]).expect("replace");
+        db.replace_org_repos("other", &[repo("unrelated")])
+            .expect("replace");
+
+        // Sorted by name, and scoped to the org (not shared across orgs).
+        let all = db.list_org_repos("o", "").expect("list");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].full_name, "o/repo-a");
+        assert_eq!(all[1].full_name, "o/repo-b");
+
+        // Name search filters the cached list.
+        let searched = db.list_org_repos("o", "repo-b").expect("search");
+        assert_eq!(searched.len(), 1);
+        assert_eq!(searched[0].full_name, "o/repo-b");
+
+        // Replacing one org's cache does not touch another org's.
+        let other = db.list_org_repos("other", "").expect("list");
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].full_name, "o/unrelated");
     }
 }

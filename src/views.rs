@@ -399,4 +399,85 @@ mod tests {
         assert!(html.contains("an open issue"));
         assert!(html.contains("mention"));
     }
+
+    #[test]
+    fn queue_filter_controls_are_htmx_wired() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("db");
+        seed(&db);
+        let ws = Workspace {
+            name: "w".into(),
+            repo_sets: vec![RepoSet {
+                name: "s".into(),
+                repos: vec!["o/r".into()],
+            }],
+            ..Default::default()
+        };
+        let html = render_queue(
+            &db,
+            &ws,
+            &QueueParams {
+                ws: "w".into(),
+                repo_set: "all".into(),
+                kind: "all".into(),
+                unread: false,
+                q: String::new(),
+                sort: "attention".into(),
+            },
+        )
+        .expect("render");
+        // Repo set, kind, unread checkbox, and sort all reload on `change`.
+        assert_eq!(html.matches(r#"hx-trigger="change""#).count(), 4);
+        assert!(html.contains(r#"hx-get="/api/views/queue""#));
+        assert!(html.contains(r#"hx-include="closest form""#));
+        // The unread checkbox must submit a value serde parses as `bool`; the
+        // server's `QueueParams.unread: bool` rejects "1" with a 400.
+        assert!(html.contains(r#"name="unread" value="true""#));
+    }
+
+    #[test]
+    fn inbox_filter_controls_are_htmx_wired() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("db");
+        seed(&db);
+        let ws = Workspace {
+            name: "w".into(),
+            repo_sets: vec![RepoSet {
+                name: "s".into(),
+                repos: vec!["o/r".into()],
+            }],
+            ..Default::default()
+        };
+        let html = render_inbox(
+            &db,
+            &ws,
+            &InboxParams {
+                ws: "w".into(),
+                repo_set: "all".into(),
+                subject_type: "all".into(),
+                reason: "all".into(),
+                unread: false,
+                sort: "updated".into(),
+            },
+        )
+        .expect("render");
+        // Repo set, type, reason, unread checkbox, and sort all reload on `change`.
+        assert_eq!(html.matches(r#"hx-trigger="change""#).count(), 5);
+        assert!(html.contains(r#"hx-get="/api/views/inbox""#));
+        assert!(html.contains(r#"hx-include="closest form""#));
+        assert!(html.contains(r#"name="unread" value="true""#));
+    }
+
+    #[test]
+    fn settings_empty_state_renders_em_dash() {
+        let ws = Workspace {
+            name: "w".into(),
+            repo_sets: vec![],
+            ..Default::default()
+        };
+        let html = render_settings(&ws).expect("render");
+        // Regression: a literal `\u2014` in the template was rendered as text.
+        assert!(!html.contains(r"\u2014"));
+        assert!(html.contains("&mdash;"));
+    }
 }

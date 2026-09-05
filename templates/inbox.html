@@ -32,7 +32,7 @@
       <option value="security_alert" {% if reason == "security_alert" %}selected{% endif %}>Security alert</option>
       <option value="subscribed" {% if reason == "subscribed" %}selected{% endif %}>Subscribed</option>
     </select>
-    <label><input type="checkbox" name="unread" value="1" {% if unread %}checked{% endif %}
+    <label><input type="checkbox" name="unread" value="true" {% if unread %}checked{% endif %}
          hx-get="/api/views/inbox" hx-target="#view" hx-swap="outerHTML"
          hx-trigger="change" hx-include="closest form"> Unread only</label>
     <select name="sort" aria-label="Sort"

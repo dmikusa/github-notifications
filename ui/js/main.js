@@ -53,6 +53,10 @@ window.App.views = (() => {
     const html = await window.App.api.getView(view, params());
     const el = document.getElementById('view');
     el.outerHTML = html;
+    // The view was swapped outside of an htmx transaction, so htmx never
+    // processed the new elements (filter controls, etc.). Register them now.
+    const newEl = document.getElementById('view');
+    if (newEl && window.htmx) htmx.process(newEl);
     window.App.table.bind();
     if (view === 'settings') {
       window.App.settings.bind();
@@ -142,8 +146,8 @@ function populateWorkspaces(state) {
       if (!name) return;
       try {
         await window.App.api.postJSON('/api/workspaces', { name });
-        populateWorkspaces(await window.App.api.getState());
         window.App.state.currentWorkspace = name;
+        populateWorkspaces(await window.App.api.getState());
         await window.App.views.reload();
       } catch (err) {
         window.App.status.set(`Add workspace failed: ${err.message}`, true);
