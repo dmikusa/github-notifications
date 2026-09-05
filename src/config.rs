@@ -183,25 +183,27 @@ repo_refresh_interval_seconds = 600
 
 # Workspaces group repos and saved filters into separate views (e.g. personal
 # vs work). Each workspace has one or more repo sets: explicit lists of repos
-# to track. Orgs are not wildcards; every tracked repo must be listed.
+# to track.
+#
+# Orgs are not wildcards; every tracked repo must be listed.
 #
 # Uncomment and edit the example below to add your first workspace.
 #
 # [[workspaces]]
-# name = "personal"
+# name = "Personal"
 # # When enabled, threads for closed + merged pull requests are auto-marked read.
 # auto_dismiss_closed_merged = false
 #
 # [[workspaces.repo_sets]]
-# name = "open-source"
+# name = "Org 1 Repos"
 # repos = [
-#   "paketo-buildpacks/paketo",
-#   "paketo-community/anthology",
+#   "org1/repo-a",
+#   "org1/repo-b",
 # ]
 #
 # [[workspaces.repo_sets]]
-# name = "work"
-# repos = ["your-company/tooling"]
+# name = "My Projects"
+# repos = ["me/repo-a"]
 "#;
 
 /// Write the commented example configuration to `path`, creating parent

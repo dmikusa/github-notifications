@@ -109,19 +109,19 @@ poll_interval_seconds = 300
 repo_refresh_interval_seconds = 600
 
 [[workspaces]]
-name = "personal"
+name = "Personal"
 auto_dismiss_closed_merged = false
 
 [[workspaces.repo_sets]]
-name = "open-source"
+name = "Org 1 Repos"
 repos = [
-  "paketo-buildpacks/paketo",
-  "paketo-community/anthology",
+  "org1/repo-a",
+  "org1/repo-b",
 ]
 
 [[workspaces.repo_sets]]
-name = "work"
-repos = ["your-company/tooling"]
+name = "My Projects"
+repos = ["me/repo-a"]
 ```
 
 ## Environment variables
