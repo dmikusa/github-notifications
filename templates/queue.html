@@ -42,7 +42,7 @@
         <td>{% if item.thread_unread %}<span class="badge unread">{% if let Some(reason) = item.thread_reason %}{{ reason }}{% else %}unread{% endif %}</span>{% endif %}</td>
       </tr>
       {% else %}
-      <tr><td colspan="7" class="empty">{% if synced %}No items match your filters.{% else %}No data yet — the first sync has not completed.{% endif %}</td></tr>
+      <tr><td colspan="7" class="empty">{% if synced %}No items match your filters.{% else %}<span class="spinner" aria-hidden="true"></span>Loading data from GitHub…{% endif %}</td></tr>
       {% endfor %}
     </tbody>
   </table>

@@ -268,7 +268,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        // A fresh DB with no last_sync should say "no data yet".
+        // A fresh DB with no last_sync should show a loading indicator.
         let html = render_queue(
             &db,
             &ws,
@@ -282,7 +282,8 @@ mod tests {
             false,
         )
         .expect("render");
-        assert!(html.contains("No data yet"));
+        assert!(html.contains("Loading data from GitHub"));
+        assert!(html.contains("spinner"));
 
         // Once synced, an empty result is a normal filtered-empty message.
         let html = render_queue(
