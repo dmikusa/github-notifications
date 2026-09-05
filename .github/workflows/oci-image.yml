@@ -27,4 +27,5 @@ jobs:
           pack build "ghcr.io/dmikusa/github-notifications:${GITHUB_REF_NAME}" \
             --builder paketobuildpacks/builder:base \
             --buildpack docker.io/paketocommunity/rust \
+            --cache-image ghcr.io/dmikusa/github-notifications:cache \
             --publish
