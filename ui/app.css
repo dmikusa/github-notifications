@@ -83,6 +83,19 @@ body {
   color: var(--danger);
 }
 
+.notice {
+  padding: 0.5rem 1.25rem;
+  font-size: 13px;
+  background: #fff8e6;
+  color: #9a6700;
+  border-bottom: 1px solid var(--border);
+}
+
+.notice.error {
+  background: #ffebe9;
+  color: var(--danger);
+}
+
 .main {
   max-width: 1200px;
   margin: 1.25rem auto;

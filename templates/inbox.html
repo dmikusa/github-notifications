@@ -53,7 +53,7 @@
         <td class="time">{{ item.updated_at }}</td>
       </tr>
       {% else %}
-      <tr><td colspan="6" class="empty">No notifications match.</td></tr>
+      <tr><td colspan="6" class="empty">{% if synced %}No notifications match your filters.{% else %}No data yet — the first sync has not completed.{% endif %}</td></tr>
       {% endfor %}
     </tbody>
   </table>

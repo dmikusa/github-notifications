@@ -193,7 +193,7 @@ async fn queue_view(
     Query(params): Query<views::QueueParams>,
 ) -> Response {
     let ws = views::resolve_workspace(&state.config, &params.ws);
-    match views::render_queue(&state.db, ws, &params) {
+    match views::render_queue(&state.db, ws, &params, synced(&state.db)) {
         Ok(html) => html_response(html),
         Err(e) => json_response(Err::<(), _>(e)),
     }
@@ -204,7 +204,7 @@ async fn inbox_view(
     Query(params): Query<views::InboxParams>,
 ) -> Response {
     let ws = views::resolve_workspace(&state.config, &params.ws);
-    match views::render_inbox(&state.db, ws, &params) {
+    match views::render_inbox(&state.db, ws, &params, synced(&state.db)) {
         Ok(html) => html_response(html),
         Err(e) => json_response(Err::<(), _>(e)),
     }
@@ -215,10 +215,18 @@ async fn repos_view(
     Query(params): Query<views::RepoParams>,
 ) -> Response {
     let ws = views::resolve_workspace(&state.config, &params.ws);
-    match views::render_repos(&state.db, ws, &params) {
+    match views::render_repos(&state.db, ws, &params, synced(&state.db)) {
         Ok(html) => html_response(html),
         Err(e) => json_response(Err::<(), _>(e)),
     }
+}
+
+/// Whether a sync has ever completed (the cache has been populated at least
+/// once). Distinct from the DB merely being empty.
+fn synced(db: &Database) -> bool {
+    db.get_sync_state("last_sync")
+        .map(|v| v.is_some())
+        .unwrap_or(false)
 }
 
 #[derive(Deserialize)]
