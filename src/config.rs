@@ -81,6 +81,14 @@ impl Workspace {
         }
         set.into_iter().collect()
     }
+
+    /// The repos of a named repo set, if it exists.
+    pub fn repo_set_repos(&self, name: &str) -> Option<Vec<String>> {
+        self.repo_sets
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.repos.clone())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -261,6 +269,27 @@ pub fn add_repo_set(path: &Path, workspace: &str, name: &str, repos: &[String]) 
         }
     }
     set.insert("repos", Item::Value(array.into()));
+    write_doc(path, &doc)
+}
+
+/// Append a new workspace (with no repo sets) to the config.
+pub fn add_workspace(path: &Path, name: &str) -> Result<()> {
+    let mut doc = load_doc(path)?;
+    if !doc.contains_key("workspaces") {
+        doc.insert("workspaces", Item::ArrayOfTables(ArrayOfTables::new()));
+    }
+    let workspaces = doc["workspaces"]
+        .as_array_of_tables_mut()
+        .context("workspaces is not a table array")?;
+    if workspaces
+        .iter()
+        .any(|t| t.get("name").and_then(Item::as_str) == Some(name))
+    {
+        anyhow::bail!("workspace {name:?} already exists");
+    }
+    let mut table = Table::new();
+    table.insert("name", value(name));
+    workspaces.push(table);
     write_doc(path, &doc)
 }
 
@@ -648,5 +677,56 @@ bogus = true
             config.workspaces[0].repo_sets[0].repos,
             vec!["a/r".to_string()]
         );
+    }
+
+    #[test]
+    fn editor_adds_workspace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = editor_config(
+            dir.path(),
+            "[github]\nauth_provider = \"gh-token\"\n\n[[workspaces]]\nname = \"personal\"\n",
+        );
+        add_workspace(&path, "work").expect("add");
+        let config = read_file(&path).expect("read");
+        assert_eq!(config.workspaces.len(), 2);
+        assert_eq!(config.workspaces[1].name, "work");
+        assert!(config.workspaces[1].repo_sets.is_empty());
+    }
+
+    #[test]
+    fn editor_rejects_duplicate_workspace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = editor_config(
+            dir.path(),
+            "[github]\nauth_provider = \"gh-token\"\n\n[[workspaces]]\nname = \"personal\"\n",
+        );
+        assert!(add_workspace(&path, "personal").is_err());
+    }
+
+    #[test]
+    fn workspace_repo_set_repos() {
+        let ws = Workspace {
+            name: "w".into(),
+            repo_sets: vec![
+                RepoSet {
+                    name: "a".into(),
+                    repos: vec!["a/r1".into(), "a/r2".into()],
+                },
+                RepoSet {
+                    name: "b".into(),
+                    repos: vec!["b/r1".into()],
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            ws.repo_set_repos("a").expect("set a"),
+            vec!["a/r1".to_string(), "a/r2".to_string()]
+        );
+        assert_eq!(
+            ws.repo_set_repos("b").expect("set b"),
+            vec!["b/r1".to_string()]
+        );
+        assert!(ws.repo_set_repos("nope").is_none());
     }
 }

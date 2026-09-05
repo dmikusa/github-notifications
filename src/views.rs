@@ -30,10 +30,27 @@ fn filter_value(value: &str) -> Option<&str> {
     }
 }
 
+/// Resolve which repos to query for `workspace` given a repo-set filter
+/// ("all"/empty means every tracked repo).
+fn repos_for_filter(workspace: &Workspace, repo_set: &str) -> Vec<String> {
+    if repo_set.is_empty() || repo_set == "all" {
+        workspace.tracked_repos()
+    } else {
+        workspace.repo_set_repos(repo_set).unwrap_or_default()
+    }
+}
+
+/// The repo set names for a workspace's filter selector.
+fn repo_set_names(workspace: &Workspace) -> Vec<String> {
+    workspace.repo_sets.iter().map(|s| s.name.clone()).collect()
+}
+
 #[derive(Template)]
 #[template(path = "queue.html")]
 struct QueueTemplate<'a> {
     ws: &'a str,
+    repo_set: &'a str,
+    repo_sets: &'a [String],
     kind: &'a str,
     unread: bool,
     q: &'a str,
@@ -44,7 +61,7 @@ struct QueueTemplate<'a> {
 /// Render the queue view fragment for `workspace`. Rows only; the frontend
 /// decides how to present the initial-loading state via `/api/sync/status`.
 pub fn render_queue(db: &Database, workspace: &Workspace, q: &QueueParams) -> Result<String> {
-    let repos = workspace.tracked_repos();
+    let repos = repos_for_filter(workspace, &q.repo_set);
     let filter = db::QueueFilter {
         repos: &repos,
         kind: if q.kind == "all" || q.kind.is_empty() {
@@ -57,8 +74,15 @@ pub fn render_queue(db: &Database, workspace: &Workspace, q: &QueueParams) -> Re
         sort: q.sort.as_str(),
     };
     let items = db.list_queue(&filter)?;
+    let repo_sets = repo_set_names(workspace);
     let template = QueueTemplate {
         ws: &workspace.name,
+        repo_set: if q.repo_set.is_empty() {
+            "all"
+        } else {
+            &q.repo_set
+        },
+        repo_sets: &repo_sets,
         kind: &q.kind,
         unread: q.unread,
         q: &q.q,
@@ -72,6 +96,8 @@ pub fn render_queue(db: &Database, workspace: &Workspace, q: &QueueParams) -> Re
 #[template(path = "inbox.html")]
 struct InboxTemplate<'a> {
     ws: &'a str,
+    repo_set: &'a str,
+    repo_sets: &'a [String],
     subject_type: &'a str,
     reason: &'a str,
     unread: bool,
@@ -81,7 +107,7 @@ struct InboxTemplate<'a> {
 
 /// Render the inbox view fragment for `workspace`.
 pub fn render_inbox(db: &Database, workspace: &Workspace, q: &InboxParams) -> Result<String> {
-    let repos = workspace.tracked_repos();
+    let repos = repos_for_filter(workspace, &q.repo_set);
     let filter = db::InboxFilter {
         repos: &repos,
         subject_type: filter_value(&q.subject_type),
@@ -90,8 +116,15 @@ pub fn render_inbox(db: &Database, workspace: &Workspace, q: &InboxParams) -> Re
         sort: q.sort.as_str(),
     };
     let items = db.list_inbox(&filter)?;
+    let repo_sets = repo_set_names(workspace);
     let template = InboxTemplate {
         ws: &workspace.name,
+        repo_set: if q.repo_set.is_empty() {
+            "all"
+        } else {
+            &q.repo_set
+        },
+        repo_sets: &repo_sets,
         subject_type: &q.subject_type,
         reason: &q.reason,
         unread: q.unread,
@@ -148,6 +181,7 @@ pub fn render_settings(workspace: &Workspace) -> Result<String> {
 #[serde(default)]
 pub struct QueueParams {
     pub ws: String,
+    pub repo_set: String,
     pub kind: String,
     pub unread: bool,
     pub q: String,
@@ -159,6 +193,7 @@ pub struct QueueParams {
 #[serde(default)]
 pub struct InboxParams {
     pub ws: String,
+    pub repo_set: String,
     #[serde(rename = "type")]
     pub subject_type: String,
     pub reason: String,
@@ -239,6 +274,7 @@ mod tests {
             &ws,
             &QueueParams {
                 ws: "w".into(),
+                repo_set: "all".into(),
                 kind: "all".into(),
                 unread: false,
                 q: String::new(),
@@ -248,6 +284,62 @@ mod tests {
         .expect("render");
         assert!(html.contains("an open issue"));
         assert!(html.contains("o/r"));
+    }
+
+    #[test]
+    fn queue_filters_by_repo_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("db");
+        // Seed two repos in two repo sets.
+        for (full, n) in [("a/r", 1u64), ("b/r", 2)] {
+            let repo_id = db
+                .upsert_repo(full, Some(&format!("https://github.com/{full}")))
+                .expect("repo");
+            let issue: GithubIssue = serde_json::from_value(serde_json::json!({
+                "id": n, "number": n, "title": format!("issue {n}"), "state": "open",
+                "user": {"login": "a"},
+                "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-02T00:00:00Z",
+                "closed_at": null,
+                "html_url": format!("https://github.com/{full}/issues/{n}"),
+                "url": format!("https://api.github.com/repos/{full}/issues/{n}")
+            }))
+            .expect("issue");
+            db.upsert_issue(repo_id, &issue, "issue", None)
+                .expect("row");
+        }
+        let ws = Workspace {
+            name: "w".into(),
+            repo_sets: vec![
+                RepoSet {
+                    name: "set-a".into(),
+                    repos: vec!["a/r".into()],
+                },
+                RepoSet {
+                    name: "set-b".into(),
+                    repos: vec!["b/r".into()],
+                },
+            ],
+            ..Default::default()
+        };
+        let params = |repo_set: &str| QueueParams {
+            ws: "w".into(),
+            repo_set: repo_set.into(),
+            kind: "all".into(),
+            unread: false,
+            q: String::new(),
+            sort: "attention".into(),
+        };
+        // Only set-a's repo.
+        let html = render_queue(&db, &ws, &params("set-a")).expect("render set-a");
+        assert!(html.contains("issue 1"));
+        assert!(!html.contains("issue 2"));
+        // Only set-b's repo.
+        let html = render_queue(&db, &ws, &params("set-b")).expect("render set-b");
+        assert!(html.contains("issue 2"));
+        assert!(!html.contains("issue 1"));
+        // "all" shows both.
+        let html = render_queue(&db, &ws, &params("all")).expect("render all");
+        assert!(html.contains("issue 1") && html.contains("issue 2"));
     }
 
     #[test]
@@ -267,6 +359,7 @@ mod tests {
             &ws,
             &QueueParams {
                 ws: "w".into(),
+                repo_set: "all".into(),
                 kind: "all".into(),
                 unread: false,
                 q: String::new(),
@@ -295,6 +388,7 @@ mod tests {
             &ws,
             &InboxParams {
                 ws: "w".into(),
+                repo_set: "all".into(),
                 subject_type: "all".into(),
                 reason: "all".into(),
                 unread: false,
@@ -304,5 +398,86 @@ mod tests {
         .expect("render");
         assert!(html.contains("an open issue"));
         assert!(html.contains("mention"));
+    }
+
+    #[test]
+    fn queue_filter_controls_are_htmx_wired() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("db");
+        seed(&db);
+        let ws = Workspace {
+            name: "w".into(),
+            repo_sets: vec![RepoSet {
+                name: "s".into(),
+                repos: vec!["o/r".into()],
+            }],
+            ..Default::default()
+        };
+        let html = render_queue(
+            &db,
+            &ws,
+            &QueueParams {
+                ws: "w".into(),
+                repo_set: "all".into(),
+                kind: "all".into(),
+                unread: false,
+                q: String::new(),
+                sort: "attention".into(),
+            },
+        )
+        .expect("render");
+        // Repo set, kind, unread checkbox, and sort all reload on `change`.
+        assert_eq!(html.matches(r#"hx-trigger="change""#).count(), 4);
+        assert!(html.contains(r#"hx-get="/api/views/queue""#));
+        assert!(html.contains(r#"hx-include="closest form""#));
+        // The unread checkbox must submit a value serde parses as `bool`; the
+        // server's `QueueParams.unread: bool` rejects "1" with a 400.
+        assert!(html.contains(r#"name="unread" value="true""#));
+    }
+
+    #[test]
+    fn inbox_filter_controls_are_htmx_wired() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("db");
+        seed(&db);
+        let ws = Workspace {
+            name: "w".into(),
+            repo_sets: vec![RepoSet {
+                name: "s".into(),
+                repos: vec!["o/r".into()],
+            }],
+            ..Default::default()
+        };
+        let html = render_inbox(
+            &db,
+            &ws,
+            &InboxParams {
+                ws: "w".into(),
+                repo_set: "all".into(),
+                subject_type: "all".into(),
+                reason: "all".into(),
+                unread: false,
+                sort: "updated".into(),
+            },
+        )
+        .expect("render");
+        // Repo set, type, reason, unread checkbox, and sort all reload on `change`.
+        assert_eq!(html.matches(r#"hx-trigger="change""#).count(), 5);
+        assert!(html.contains(r#"hx-get="/api/views/inbox""#));
+        assert!(html.contains(r#"hx-include="closest form""#));
+        assert!(html.contains(r#"name="unread" value="true""#));
+    }
+
+    #[test]
+    fn settings_empty_state_renders_em_dash() {
+        let ws = Workspace {
+            name: "w".into(),
+            repo_sets: vec![],
+            ..Default::default()
+        };
+        let html = render_settings(&ws).expect("render");
+        // Regression: a literal `\u2014` in the template was rendered as text.
+        assert!(!html.contains(r"\u2014"));
+        assert!(html.contains("&mdash;"));
     }
 }

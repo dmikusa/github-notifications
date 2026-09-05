@@ -1,15 +1,30 @@
 <div id="view" data-view="queue">
-  <form class="filters" hx-get="/api/views/queue" hx-target="#view" hx-swap="outerHTML"
-        hx-trigger="change, submit">
+  <form class="filters">
     <input type="hidden" name="ws" value="{{ ws }}">
-    <select name="kind" aria-label="Type">
+    <select name="repo_set" aria-label="Repo set"
+            hx-get="/api/views/queue" hx-target="#view" hx-swap="outerHTML"
+            hx-trigger="change" hx-include="closest form">
+      <option value="all" {% if repo_set == "all" %}selected{% endif %}>All repo sets</option>
+      {% for set in repo_sets %}
+      <option value="{{ set }}" {% if repo_set == set %}selected{% endif %}>{{ set }}</option>
+      {% endfor %}
+    </select>
+    <select name="kind" aria-label="Type"
+            hx-get="/api/views/queue" hx-target="#view" hx-swap="outerHTML"
+            hx-trigger="change" hx-include="closest form">
       <option value="all" {% if kind == "all" %}selected{% endif %}>All</option>
       <option value="issue" {% if kind == "issue" %}selected{% endif %}>Issues</option>
       <option value="pr" {% if kind == "pr" %}selected{% endif %}>Pull requests</option>
     </select>
-    <label><input type="checkbox" name="unread" value="1" {% if unread %}checked{% endif %}> Unread only</label>
-    <input type="search" name="q" value="{{ q }}" placeholder="Search title">
-    <select name="sort" aria-label="Sort">
+    <label><input type="checkbox" name="unread" value="true" {% if unread %}checked{% endif %}
+         hx-get="/api/views/queue" hx-target="#view" hx-swap="outerHTML"
+         hx-trigger="change" hx-include="closest form"> Unread only</label>
+    <input type="search" name="q" value="{{ q }}" placeholder="Search title"
+         hx-get="/api/views/queue" hx-target="#view" hx-swap="outerHTML"
+         hx-trigger="input changed delay:300ms" hx-include="closest form">
+    <select name="sort" aria-label="Sort"
+            hx-get="/api/views/queue" hx-target="#view" hx-swap="outerHTML"
+            hx-trigger="change" hx-include="closest form">
       <option value="attention" {% if sort == "attention" %}selected{% endif %}>Attention</option>
       <option value="updated" {% if sort == "updated" %}selected{% endif %}>Updated</option>
       <option value="created" {% if sort == "created" %}selected{% endif %}>Created</option>

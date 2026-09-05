@@ -19,6 +19,10 @@ pub struct SyncStatus {
     pub last_sync: Option<String>,
     pub last_error: Option<String>,
     pub rate_limit: Option<RateLimit>,
+    /// Whether a manual "dismiss closed/merged" pass is in flight.
+    pub dismiss_running: bool,
+    /// Count from the last completed manual dismiss pass.
+    pub last_dismiss: Option<usize>,
 }
 
 /// Background sync engine handle.
@@ -328,7 +332,15 @@ async fn maybe_auto_dismiss(client: &Client, db: &Database, config: &Config) -> 
     {
         return Ok(());
     }
+    let _ = dismiss_closed_merged(client, db).await?;
+    Ok(())
+}
 
+/// Mark read any unread pull-request threads whose PR is closed and merged.
+/// Returns the number dismissed. Used by the auto-dismiss option and by a
+/// manual "dismiss closed/merged" action in the UI.
+pub async fn dismiss_closed_merged(client: &Client, db: &Database) -> Result<usize> {
+    let mut count = 0;
     let mut seen = BTreeSet::new();
     for (thread_id, thread_api_url, subject_api_url) in db.get_unread_pr_threads()? {
         if !seen.insert(subject_api_url.clone()) {
@@ -367,11 +379,12 @@ async fn maybe_auto_dismiss(client: &Client, db: &Database, config: &Config) -> 
                     | axum::http::StatusCode::RESET_CONTENT
             ) {
                 db.set_thread_unread(&thread_id, false)?;
-                tracing::info!("auto-dismissed merged PR thread {thread_id}");
+                count += 1;
+                tracing::info!("dismissed merged PR thread {thread_id}");
             }
         }
     }
-    Ok(())
+    Ok(count)
 }
 
 fn record_rate_limit(status: &Arc<Mutex<SyncStatus>>, headers: &HeaderMap) {
@@ -391,7 +404,7 @@ fn tracked_repos(config: &Config) -> Vec<String> {
 }
 
 /// Whether the stored timestamp (RFC3339) is older than `interval_seconds`.
-fn due(last: &Option<String>, interval_seconds: u64) -> bool {
+pub fn due(last: &Option<String>, interval_seconds: u64) -> bool {
     match last {
         None => true,
         Some(raw) => {
