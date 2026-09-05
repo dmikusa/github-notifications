@@ -129,6 +129,7 @@ repos = ["me/repo-a"]
 | Variable | Purpose |
 | --- | --- |
 | `GITHUB_TOKEN` | Classic PAT override when `auth_token` is empty |
+| `GHNOTIFY_CONFIG` | Config file path override (equivalent to `--config`) |
 | `HOST` | Listen address override (default `127.0.0.1`); use `0.0.0.0` to expose the server beyond loopback |
 | `PORT` | Listen port override (default `8080`) |
 | `GHNOTIFY_DATA_DIR` | Override the SQLite data directory |
