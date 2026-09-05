@@ -87,6 +87,8 @@ impl Client {
             let mut builder = match method {
                 "GET" => self.http.get(url),
                 "PATCH" => self.http.patch(url),
+                "PUT" => self.http.put(url),
+                "DELETE" => self.http.delete(url),
                 _ => {
                     return Err(ClientError::Github(
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -140,6 +142,20 @@ impl Client {
     /// thread read).
     pub async fn patch(&self, path: &str) -> Result<GitResponse, ClientError> {
         self.request("PATCH", &format!("{}{}", self.base, path), &[], None)
+            .await
+    }
+
+    /// Authenticated `PUT` to a path under the API base URL (e.g. marking all
+    /// notifications read).
+    pub async fn put(&self, path: &str) -> Result<GitResponse, ClientError> {
+        self.request("PUT", &format!("{}{}", self.base, path), &[], None)
+            .await
+    }
+
+    /// Authenticated `DELETE` to a path under the API base URL (e.g. unsubscribing
+    /// from a thread).
+    pub async fn delete(&self, path: &str) -> Result<GitResponse, ClientError> {
+        self.request("DELETE", &format!("{}{}", self.base, path), &[], None)
             .await
     }
 

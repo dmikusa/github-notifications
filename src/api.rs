@@ -1,13 +1,14 @@
 use std::sync::{Arc, Mutex};
 
+use anyhow::Result;
 use axum::{
-    extract::State,
+    extract::{Path, Query, State},
     http::{header, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Router,
+    Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::{
@@ -17,6 +18,7 @@ use crate::{
     db::Database,
     github::{self, RateLimit, Validation},
     sync::SyncStatus,
+    views,
 };
 
 /// Shared application state handed to every handler.
@@ -40,6 +42,14 @@ pub fn router(state: AppState) -> Router {
         .route("/app.js", get(app_js_handler))
         .route("/api/state", get(state_handler))
         .route("/api/sync", post(sync_handler))
+        .route("/api/views/queue", get(queue_view))
+        .route("/api/views/inbox", get(inbox_view))
+        .route("/api/views/repos", get(repos_view))
+        .route("/api/threads/mark-read", post(threads_mark_read))
+        .route("/api/issues/mark-read", post(issues_mark_read))
+        .route("/api/threads/mute", post(thread_mute))
+        .route("/api/repos/{owner}/{repo}/watch", post(repo_watch))
+        .route("/api/repos/{owner}/{repo}/unwatch", post(repo_unwatch))
         .fallback(static_handler)
         .with_state(state)
 }
@@ -155,6 +165,206 @@ async fn sync_handler(State(state): State<AppState>) -> Response {
         r#"{"status":"accepted"}"#,
     )
         .into_response()
+}
+
+fn html_response(html: String) -> Response {
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
+}
+
+fn json_response(result: Result<impl Serialize>) -> Response {
+    match result {
+        Ok(value) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&value).unwrap_or_else(|_| "{}".into()),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::CONTENT_TYPE, "application/json")],
+            format!(r#"{{"error":{:?}}}"#, e.to_string()),
+        )
+            .into_response(),
+    }
+}
+
+async fn queue_view(
+    State(state): State<AppState>,
+    Query(params): Query<views::QueueParams>,
+) -> Response {
+    let ws = views::resolve_workspace(&state.config, &params.ws);
+    match views::render_queue(&state.db, ws, &params) {
+        Ok(html) => html_response(html),
+        Err(e) => json_response(Err::<(), _>(e)),
+    }
+}
+
+async fn inbox_view(
+    State(state): State<AppState>,
+    Query(params): Query<views::InboxParams>,
+) -> Response {
+    let ws = views::resolve_workspace(&state.config, &params.ws);
+    match views::render_inbox(&state.db, ws, &params) {
+        Ok(html) => html_response(html),
+        Err(e) => json_response(Err::<(), _>(e)),
+    }
+}
+
+async fn repos_view(
+    State(state): State<AppState>,
+    Query(params): Query<views::RepoParams>,
+) -> Response {
+    let ws = views::resolve_workspace(&state.config, &params.ws);
+    match views::render_repos(&state.db, ws, &params) {
+        Ok(html) => html_response(html),
+        Err(e) => json_response(Err::<(), _>(e)),
+    }
+}
+
+#[derive(Deserialize)]
+struct ThreadsMarkReadBody {
+    ids: Option<Vec<String>>,
+    all: Option<bool>,
+    ws: Option<String>,
+}
+
+async fn threads_mark_read(
+    State(state): State<AppState>,
+    Json(body): Json<ThreadsMarkReadBody>,
+) -> Response {
+    let result = async {
+        if body.all == Some(true) {
+            let ws = views::resolve_workspace(&state.config, body.ws.as_deref().unwrap_or(""));
+            let res = state.github.put("/notifications").await?;
+            ensure_success(&res.status, "mark all notifications read")?;
+            let repos = ws.tracked_repos();
+            state.db.set_unread_for_repos(&repos, false)?;
+            return Ok::<usize, anyhow::Error>(repos.len());
+        }
+        let ids = body.ids.unwrap_or_default();
+        mark_threads_read(&state, &ids).await
+    }
+    .await;
+    json_response(result)
+}
+
+#[derive(Deserialize)]
+struct IssuesMarkReadBody {
+    ids: Vec<i64>,
+}
+
+async fn issues_mark_read(
+    State(state): State<AppState>,
+    Json(body): Json<IssuesMarkReadBody>,
+) -> Response {
+    let result = async {
+        let mut thread_ids = Vec::new();
+        for id in body.ids {
+            if let Some(api_url) = state.db.issue_api_url(id)? {
+                for (thread_id, _api) in state.db.threads_for_subject(&api_url)? {
+                    thread_ids.push(thread_id);
+                }
+            }
+        }
+        mark_threads_read(&state, &thread_ids).await
+    }
+    .await;
+    json_response(result)
+}
+
+#[derive(Deserialize)]
+struct MuteBody {
+    id: String,
+}
+
+async fn thread_mute(State(state): State<AppState>, Json(body): Json<MuteBody>) -> Response {
+    let result = async {
+        let Some(api_url) = state.db.thread_api_url(&body.id)? else {
+            return Ok::<(), anyhow::Error>(());
+        };
+        let Some(numeric) = api_url.rsplit('/').next().map(str::to_string) else {
+            return Ok(());
+        };
+        let res = state
+            .github
+            .delete(&format!("/notifications/threads/{numeric}/subscription"))
+            .await?;
+        ensure_success(&res.status, "mute thread")?;
+        Ok(())
+    }
+    .await;
+    json_response(result)
+}
+
+async fn repo_watch(
+    State(state): State<AppState>,
+    Path((owner, repo)): Path<(String, String)>,
+) -> Response {
+    let full = format!("{owner}/{repo}");
+    let result = async {
+        let res = state
+            .github
+            .put(&format!("/user/subscriptions/{owner}/{repo}"))
+            .await?;
+        ensure_success(&res.status, "watch repo")?;
+        state.db.set_repo_watched(&full, true)?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    json_response(result)
+}
+
+async fn repo_unwatch(
+    State(state): State<AppState>,
+    Path((owner, repo)): Path<(String, String)>,
+) -> Response {
+    let full = format!("{owner}/{repo}");
+    let result = async {
+        let res = state
+            .github
+            .delete(&format!("/user/subscriptions/{owner}/{repo}"))
+            .await?;
+        ensure_success(&res.status, "unwatch repo")?;
+        state.db.set_repo_watched(&full, false)?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    json_response(result)
+}
+
+/// Mark a set of threads read on GitHub and locally. Returns the count marked.
+async fn mark_threads_read(state: &AppState, thread_ids: &[String]) -> Result<usize> {
+    let mut count = 0;
+    for id in thread_ids {
+        let Some(api_url) = state.db.thread_api_url(id)? else {
+            continue;
+        };
+        let Some(numeric) = api_url.rsplit('/').next().map(str::to_string) else {
+            continue;
+        };
+        let res = state
+            .github
+            .patch(&format!("/notifications/threads/{numeric}"))
+            .await?;
+        if matches!(
+            res.status,
+            StatusCode::OK | StatusCode::NO_CONTENT | StatusCode::RESET_CONTENT
+        ) {
+            state
+                .db
+                .set_threads_unread(std::slice::from_ref(id), false)?;
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn ensure_success(status: &StatusCode, what: &str) -> Result<()> {
+    if status.is_success() {
+        Ok(())
+    } else {
+        anyhow::bail!("{what} returned {status}")
+    }
 }
 
 fn provider_name(provider: AuthProvider) -> &'static str {
@@ -296,5 +506,195 @@ mod tests {
         let app = router(test_state());
         let (status, _) = get_body(app, "/nope").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    fn state_with_client(db: Arc<Database>, client: github::Client) -> AppState {
+        let config = Config {
+            github: GithubConfig {
+                auth_provider: AuthProvider::Pat,
+                auth_token: "ghp_test".into(),
+                ..Default::default()
+            },
+            workspaces: vec![Workspace {
+                name: "personal".into(),
+                auto_dismiss_closed_merged: false,
+                repo_sets: vec![crate::config::RepoSet {
+                    name: "mine".into(),
+                    repos: vec!["o/r".into()],
+                }],
+            }],
+        };
+        let token: Arc<dyn TokenProvider> = Arc::new(ClassicPat::new("ghp_test".into()));
+        let (sync_trigger, _rx) = tokio::sync::mpsc::channel(8);
+        AppState {
+            config: Arc::new(config),
+            db,
+            github: client,
+            token,
+            validation: Arc::new(Mutex::new(None)),
+            sync_status: Arc::new(Mutex::new(SyncStatus::default())),
+            sync_trigger,
+        }
+    }
+
+    async fn mock_github_actions() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::routing::{delete, patch, put};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let patch_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/notifications/threads/111",
+                patch({
+                    let calls = patch_calls.clone();
+                    move || {
+                        let calls = calls.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::RESET_CONTENT
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/user/subscriptions/o/r",
+                put(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/user/subscriptions/o/r",
+                delete(|| async { StatusCode::NO_CONTENT }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        (base, patch_calls)
+    }
+
+    #[tokio::test]
+    async fn issues_mark_read_calls_github_and_updates_local() {
+        let (base, patch_calls) = mock_github_actions().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(Database::open(&dir.path().join("data.db")).expect("db"));
+
+        let repo_id = db
+            .upsert_repo("o/r", Some("https://github.com/o/r"))
+            .expect("repo");
+        let issue: crate::models::GithubIssue = serde_json::from_value(serde_json::json!({
+            "id": 1, "number": 3, "title": "t", "state": "open",
+            "user": {"login": "a"},
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+            "closed_at": null,
+            "html_url": "https://github.com/o/r/issues/3",
+            "url": "https://api.github.com/repos/o/r/issues/3"
+        }))
+        .expect("issue");
+        db.upsert_issue(repo_id, &issue, "issue", None)
+            .expect("issue row");
+
+        let thread = crate::models::NotificationThread {
+            id: "1:111".into(),
+            unread: true,
+            reason: "mention".into(),
+            updated_at: "2026-01-02T00:00:00Z".into(),
+            last_read_at: None,
+            subject: crate::models::ThreadSubject {
+                title: "t".into(),
+                kind: "Issue".into(),
+                url: Some("https://api.github.com/repos/o/r/issues/3".into()),
+                latest_comment_url: None,
+            },
+            repository: Some(crate::models::ThreadRepository {
+                full_name: "o/r".into(),
+                html_url: "https://github.com/o/r".into(),
+            }),
+            url: "https://api.github.com/notifications/threads/111".into(),
+        };
+        db.upsert_thread(&thread).expect("thread row");
+
+        let issue_id = db.with_conn(|conn| {
+            conn.query_row("SELECT id FROM issues WHERE number = 3", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .expect("issue id")
+        });
+
+        let client = github::Client::with_base(Arc::new(ClassicPat::new("ghp_x".into())), &base);
+        let app = router(state_with_client(db.clone(), client));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/issues/mark-read")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"ids":[{issue_id}]}}"#)))
+                    .expect("request"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(patch_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        let unread = db.unread_thread_count().expect("unread");
+        assert_eq!(unread, 0);
+    }
+
+    #[tokio::test]
+    async fn repo_watch_and_unwatch_update_local_flag() {
+        let (base, _patch_calls) = mock_github_actions().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(Database::open(&dir.path().join("data.db")).expect("db"));
+        db.upsert_repo("o/r", Some("https://github.com/o/r"))
+            .expect("repo");
+
+        let client = github::Client::with_base(Arc::new(ClassicPat::new("ghp_x".into())), &base);
+        let app = router(state_with_client(db.clone(), client));
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/repos/o/r/watch")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::OK);
+        let watched = db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT is_watched FROM repos WHERE full_name='o/r'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .expect("watched")
+        });
+        assert_eq!(watched, 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/repos/o/r/unwatch")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::OK);
+        let watched = db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT is_watched FROM repos WHERE full_name='o/r'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .expect("watched")
+        });
+        assert_eq!(watched, 0);
     }
 }

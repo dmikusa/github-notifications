@@ -1,0 +1,43 @@
+<div id="view" data-view="repos">
+  <form class="filters" hx-get="/api/views/repos" hx-target="#view" hx-swap="outerHTML"
+        hx-trigger="change, submit">
+    <input type="hidden" name="ws" value="{{ ws }}">
+    <select name="show" aria-label="Show">
+      <option value="all" {% if show == "all" %}selected{% endif %}>All</option>
+      <option value="watched" {% if show == "watched" %}selected{% endif %}>Watched</option>
+      <option value="untracked" {% if show == "untracked" %}selected{% endif %}>Not watched</option>
+    </select>
+    <input type="search" name="q" value="{{ q }}" placeholder="Search repos">
+  </form>
+
+  <table class="data">
+    <thead>
+      <tr>
+        <th class="chk"><input type="checkbox" class="sel-all"></th>
+        <th>Repo</th>
+        <th>Watched</th>
+        <th>Tracked</th>
+        <th>Last refreshed</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in items %}
+      <tr>
+        <td class="chk"><input type="checkbox" class="sel" value="{{ item.full_name }}"></td>
+        <td class="repo"><a href="{{ item.html_url }}" target="_blank" rel="noopener">{{ item.full_name }}</a></td>
+        <td>{% if item.is_watched %}<span class="badge ok">watched</span>{% else %}<span class="badge">not watched</span>{% endif %}</td>
+        <td>{% if item.in_workspace %}<span class="badge ok">tracked</span>{% endif %}</td>
+        <td class="time">{% if let Some(ts) = item.last_refreshed_at %}{{ ts }}{% endif %}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="empty">No repos match.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <div class="bulk-bar" hidden>
+    <span class="sel-count"></span>
+    <button data-action="watch">Watch</button>
+    <button data-action="unwatch">Unwatch</button>
+  </div>
+</div>

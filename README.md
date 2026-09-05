@@ -40,6 +40,16 @@ $ cargo test
 
 Run `cargo fmt` and `cargo clippy -- -D warnings` before committing.
 
+### Checks
+
+```console
+$ cargo test              # unit + integration tests (no network)
+$ cargo online-checks     # live GitHub smoke test (needs GITHUB_TOKEN or a logged-in gh)
+```
+
+Online and other non-default tests are grouped by a name-prefix convention;
+see [docs/testing.md](docs/testing.md) for the groups and how to add one.
+
 ## Architecture & plan
 
 - [docs/architecture.md](docs/architecture.md) — C4 architecture diagrams.

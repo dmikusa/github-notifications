@@ -67,6 +67,21 @@ pub struct Workspace {
     pub repo_sets: Vec<RepoSet>,
 }
 
+impl Workspace {
+    /// All repos across this workspace's repo sets, deduplicated and sorted.
+    pub fn tracked_repos(&self) -> Vec<String> {
+        let mut set = std::collections::BTreeSet::new();
+        for repo_set in &self.repo_sets {
+            for repo in &repo_set.repos {
+                if !repo.is_empty() {
+                    set.insert(repo.clone());
+                }
+            }
+        }
+        set.into_iter().collect()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RepoSet {

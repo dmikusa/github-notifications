@@ -1,25 +1,84 @@
 // js/main.js:
 window.App = window.App || {};
 
-(async () => {
-  const main = document.getElementById('main');
+window.App.status = (() => {
+  function set(text, isError) {
+    const el = document.getElementById('status');
+    if (!el) return;
+    el.textContent = text || '';
+    el.classList.toggle('error', !!isError);
+  }
+  return { set };
+})();
 
+window.App.views = (() => {
+  function params() {
+    return { ws: window.App.state.currentWorkspace };
+  }
+
+  async function load(view) {
+    window.App.state.currentView = view;
+    document.querySelectorAll('#tabs .tab').forEach((t) => {
+      t.classList.toggle('active', t.dataset.view === view);
+    });
+    const html = await window.App.api.getView(view, params());
+    const el = document.getElementById('view');
+    el.outerHTML = html;
+    window.App.table.bind();
+  }
+
+  async function reload() {
+    await load(window.App.state.currentView);
+  }
+
+  return { load, reload };
+})();
+
+(async () => {
   try {
-    const state = await window.App.state.refresh();
-    const auth = state.auth;
-    let authText;
-    if (!auth.authenticated) {
-      authText = `${auth.provider} (no token)`;
-    } else if (auth.ok) {
-      authText = `${auth.provider} as ${auth.login || 'unknown'}`;
-    } else {
-      authText = `${auth.provider} as ${auth.login || 'unknown'} \u2014 missing scopes: ${auth.missing.join(', ') || 'unknown'}`;
+    const state = await window.App.api.getState();
+    window.App.state.setWorkspaces(state.workspaces.map((w) => w.name));
+
+    const wsSel = document.getElementById('ws');
+    state.workspaces.forEach((w) => {
+      const opt = document.createElement('option');
+      opt.value = w.name;
+      opt.textContent = w.name;
+      wsSel.appendChild(opt);
+    });
+    if (window.App.state.currentWorkspace) {
+      wsSel.value = window.App.state.currentWorkspace;
     }
-    main.textContent =
-      `Connected. v${state.version} \u00b7 ${state.workspaces.length} workspace(s) ` +
-      `\u00b7 auth: ${authText}` +
-      (state.sync.last_sync ? ` \u00b7 last sync ${state.sync.last_sync}` : '');
+
+    const auth = state.auth;
+    let authText = `auth: ${auth.provider}`;
+    if (auth.ok) {
+      authText += ` as ${auth.login || 'unknown'}`;
+    } else {
+      authText += ` (${auth.missing.join(', ') || 'unconfigured'})`;
+    }
+    if (state.sync.last_sync) authText += ` \u00b7 last sync ${state.sync.last_sync}`;
+    window.App.status.set(authText);
+
+    document.getElementById('tabs').addEventListener('click', (e) => {
+      const tab = e.target.closest('.tab');
+      if (tab) window.App.views.load(tab.dataset.view);
+    });
+    wsSel.addEventListener('change', () => {
+      window.App.state.currentWorkspace = wsSel.value;
+      window.App.views.reload();
+    });
+    document.getElementById('sync').addEventListener('click', async () => {
+      await window.App.api.postJSON('/api/sync', {});
+      window.App.status.set('sync requested');
+    });
+
+    await window.App.views.load('queue');
   } catch (err) {
-    main.textContent = `Failed to reach the daemon: ${err.message}`;
+    window.App.status.set(`Failed to reach the daemon: ${err.message}`, true);
   }
 })();
+
+document.addEventListener('htmx:afterSwap', () => {
+  window.App.table.bind();
+});

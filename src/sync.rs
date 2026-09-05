@@ -67,6 +67,16 @@ impl SyncEngine {
     }
 }
 
+/// Run a single full sync pass (notifications, repo refresh, watches,
+/// auto-dismiss) with a throwaway status. Returns the sync timestamp.
+///
+/// Public so integration tests (e.g. the online smoke check in `tests/`) can
+/// run one pass against live GitHub.
+pub async fn sync_all(client: &Client, db: &Database, config: &Config) -> Result<String> {
+    let status = Arc::new(Mutex::new(SyncStatus::default()));
+    sync_once(client, db, config, &status, true).await
+}
+
 /// One pass of the sync engine. `force` bypasses the repo-refresh cadence
 /// (used for the initial sync and manual triggers).
 async fn run_sync(
@@ -365,12 +375,8 @@ fn record_rate_limit(status: &Arc<Mutex<SyncStatus>>, headers: &HeaderMap) {
 fn tracked_repos(config: &Config) -> Vec<String> {
     let mut set = BTreeSet::new();
     for workspace in &config.workspaces {
-        for repo_set in &workspace.repo_sets {
-            for repo in &repo_set.repos {
-                if !repo.is_empty() {
-                    set.insert(repo.clone());
-                }
-            }
+        for repo in workspace.tracked_repos() {
+            set.insert(repo);
         }
     }
     set.into_iter().collect()

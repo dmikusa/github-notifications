@@ -1,0 +1,67 @@
+<div id="view" data-view="inbox">
+  <form class="filters" hx-get="/api/views/inbox" hx-target="#view" hx-swap="outerHTML"
+        hx-trigger="change, submit">
+    <input type="hidden" name="ws" value="{{ ws }}">
+    <select name="type" aria-label="Type">
+      <option value="all" {% if subject_type == "all" %}selected{% endif %}>All types</option>
+      <option value="Issue" {% if subject_type == "Issue" %}selected{% endif %}>Issue</option>
+      <option value="PullRequest" {% if subject_type == "PullRequest" %}selected{% endif %}>Pull request</option>
+      <option value="CheckSuite" {% if subject_type == "CheckSuite" %}selected{% endif %}>Checks</option>
+      <option value="Discussion" {% if subject_type == "Discussion" %}selected{% endif %}>Discussion</option>
+      <option value="Release" {% if subject_type == "Release" %}selected{% endif %}>Release</option>
+    </select>
+    <select name="reason" aria-label="Reason">
+      <option value="all" {% if reason == "all" %}selected{% endif %}>All reasons</option>
+      <option value="mention" {% if reason == "mention" %}selected{% endif %}>Mention</option>
+      <option value="assign" {% if reason == "assign" %}selected{% endif %}>Assigned</option>
+      <option value="review_requested" {% if reason == "review_requested" %}selected{% endif %}>Review requested</option>
+      <option value="comment" {% if reason == "comment" %}selected{% endif %}>Comment</option>
+      <option value="ci_activity" {% if reason == "ci_activity" %}selected{% endif %}>CI activity</option>
+      <option value="state_change" {% if reason == "state_change" %}selected{% endif %}>State change</option>
+      <option value="security_alert" {% if reason == "security_alert" %}selected{% endif %}>Security alert</option>
+      <option value="subscribed" {% if reason == "subscribed" %}selected{% endif %}>Subscribed</option>
+    </select>
+    <label><input type="checkbox" name="unread" value="1" {% if unread %}checked{% endif %}> Unread only</label>
+    <select name="sort" aria-label="Sort">
+      <option value="updated" {% if sort == "updated" %}selected{% endif %}>Updated</option>
+      <option value="repo" {% if sort == "repo" %}selected{% endif %}>Repo</option>
+    </select>
+  </form>
+
+  <table class="data">
+    <thead>
+      <tr>
+        <th class="chk"><input type="checkbox" class="sel-all"></th>
+        <th>Repo</th>
+        <th>Type</th>
+        <th>Title</th>
+        <th>Reason</th>
+        <th>Updated</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in items %}
+      <tr class="{% if item.unread %}row-unread{% endif %}">
+        <td class="chk"><input type="checkbox" class="sel" value="{{ item.thread_id }}"{% if let Some(url) = item.subject_html_url %} data-html-url="{{ url }}"{% endif %}></td>
+        <td class="repo">{{ item.repo }}</td>
+        <td><span class="badge">{{ item.subject_type }}</span></td>
+        <td class="title">
+          {% if let Some(url) = item.subject_html_url %}<a href="{{ url }}" target="_blank" rel="noopener">{{ item.subject_title }}</a>
+          {% else %}{{ item.subject_title }}{% endif %}
+        </td>
+        <td>{{ item.reason }}</td>
+        <td class="time">{{ item.updated_at }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="empty">No notifications match.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <div class="bulk-bar" hidden>
+    <span class="sel-count"></span>
+    <button data-action="mark-read">Mark read</button>
+    <button data-action="mark-all-read">Mark all read</button>
+    <button data-action="open">Open in GitHub</button>
+  </div>
+</div>

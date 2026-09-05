@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 /// Resolve the directory holding local data files, honoring
 /// `GHNOTIFY_DATA_DIR`, then XDG, then the conventional macOS location.
@@ -26,6 +26,78 @@ pub fn default_data_dir() -> PathBuf {
 /// single-user local app; the SQLite cache layer keeps statements short-lived.
 pub struct Database {
     conn: Mutex<Connection>,
+}
+
+/// One row of the queue (an open issue or PR joined to its latest thread).
+#[derive(Debug, Clone)]
+pub struct QueueItem {
+    pub id: i64,
+    pub repo: String,
+    pub kind: String,
+    pub number: i64,
+    pub title: String,
+    pub state: String,
+    pub updated_at: String,
+    pub created_at: String,
+    pub html_url: String,
+    pub thread_unread: bool,
+    pub thread_reason: Option<String>,
+    pub thread_updated: Option<String>,
+}
+
+/// Filters for the queue query.
+#[derive(Debug, Default)]
+pub struct QueueFilter<'a> {
+    pub repos: &'a [String],
+    pub kind: Option<&'a str>,
+    pub unread_only: bool,
+    pub search: Option<&'a str>,
+    /// "attention" | "updated" | "created" | "repo"
+    pub sort: &'a str,
+}
+
+/// One row of the inbox (a notification thread).
+#[derive(Debug, Clone)]
+pub struct InboxItem {
+    pub thread_id: String,
+    pub repo: String,
+    pub subject_type: String,
+    pub subject_title: String,
+    pub reason: String,
+    pub unread: bool,
+    pub updated_at: String,
+    pub subject_api_url: Option<String>,
+    pub subject_html_url: Option<String>,
+}
+
+/// Filters for the inbox query.
+#[derive(Debug, Default)]
+pub struct InboxFilter<'a> {
+    pub repos: &'a [String],
+    pub subject_type: Option<&'a str>,
+    pub reason: Option<&'a str>,
+    pub unread_only: bool,
+    pub sort: &'a str,
+}
+
+/// One row of the repos view.
+#[derive(Debug, Clone)]
+pub struct RepoItem {
+    pub full_name: String,
+    pub html_url: String,
+    pub is_watched: bool,
+    pub in_workspace: bool,
+    pub last_refreshed_at: Option<String>,
+}
+
+/// Filters for the repos query.
+#[derive(Debug, Default)]
+pub struct RepoFilter<'a> {
+    /// Repos tracked by the current workspace (determines `in_workspace`).
+    pub workspace_repos: &'a [String],
+    /// "all" | "watched" | "untracked" (show mode)
+    pub show: &'a str,
+    pub search: Option<&'a str>,
 }
 
 impl Database {
@@ -317,6 +389,286 @@ CREATE TABLE IF NOT EXISTS sync_state (
         })
         .context("counting unread threads")
     }
+
+    /// List open issues/PRs for the given repos, joined to their latest thread.
+    pub fn list_queue(&self, f: &QueueFilter) -> Result<Vec<QueueItem>> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let mut sql = String::from(
+            "SELECT i.id, r.full_name, i.kind, i.number, i.title, i.state,
+                    i.updated_at, i.created_at, i.html_url,
+                    COALESCE((SELECT t.unread FROM threads t
+                              WHERE t.repo_id = i.repo_id AND t.subject_api_url = i.api_url
+                              ORDER BY t.updated_at DESC LIMIT 1), 0) AS thread_unread,
+                    (SELECT t.reason FROM threads t
+                     WHERE t.repo_id = i.repo_id AND t.subject_api_url = i.api_url
+                     ORDER BY t.updated_at DESC LIMIT 1) AS thread_reason,
+                    (SELECT t.updated_at FROM threads t
+                     WHERE t.repo_id = i.repo_id AND t.subject_api_url = i.api_url
+                     ORDER BY t.updated_at DESC LIMIT 1) AS thread_updated
+             FROM issues i JOIN repos r ON r.id = i.repo_id
+             WHERE i.state = 'open'",
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let repo_clause = in_clause(f.repos.len());
+        sql.push_str(&format!(" AND r.full_name IN {repo_clause}"));
+        for repo in f.repos {
+            params.push(Box::new(repo.clone()));
+        }
+        if let Some(kind) = f.kind {
+            sql.push_str(" AND i.kind = ?");
+            params.push(Box::new(kind.to_string()));
+        }
+        if f.unread_only {
+            sql.push_str(
+                " AND EXISTS (SELECT 1 FROM threads t
+                             WHERE t.repo_id = i.repo_id AND t.subject_api_url = i.api_url
+                               AND t.unread = 1)",
+            );
+        }
+        if let Some(search) = f.search.filter(|s| !s.is_empty()) {
+            sql.push_str(" AND i.title LIKE ?");
+            params.push(Box::new(format!("%{search}%")));
+        }
+        let order = match f.sort {
+            "updated" => "ORDER BY i.updated_at DESC",
+            "created" => "ORDER BY i.created_at DESC",
+            "repo" => "ORDER BY r.full_name, i.number DESC",
+            _ => "ORDER BY COALESCE(thread_updated, i.updated_at) DESC",
+        };
+        sql.push_str(order);
+
+        let mut stmt = conn.prepare(&sql).context("preparing queue query")?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok(QueueItem {
+                    id: row.get(0)?,
+                    repo: row.get(1)?,
+                    kind: row.get(2)?,
+                    number: row.get(3)?,
+                    title: row.get(4)?,
+                    state: row.get(5)?,
+                    updated_at: row.get(6)?,
+                    created_at: row.get(7)?,
+                    html_url: row.get(8)?,
+                    thread_unread: row.get::<_, i64>(9)? != 0,
+                    thread_reason: row.get(10)?,
+                    thread_updated: row.get(11)?,
+                })
+            })
+            .context("querying queue")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("reading queue")
+    }
+
+    /// List notification threads for the given repos.
+    pub fn list_inbox(&self, f: &InboxFilter) -> Result<Vec<InboxItem>> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let mut sql = String::from(
+            "SELECT t.thread_id, r.full_name, t.subject_type, t.subject_title,
+                    t.reason, t.unread, t.updated_at, t.subject_api_url
+             FROM threads t JOIN repos r ON r.id = t.repo_id
+             WHERE 1 = 1",
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let repo_clause = in_clause(f.repos.len());
+        sql.push_str(&format!(" AND r.full_name IN {repo_clause}"));
+        for repo in f.repos {
+            params.push(Box::new(repo.clone()));
+        }
+        if f.unread_only {
+            sql.push_str(" AND t.unread = 1");
+        }
+        if let Some(kind) = f.subject_type.filter(|s| *s != "all") {
+            sql.push_str(" AND t.subject_type = ?");
+            params.push(Box::new(kind.to_string()));
+        }
+        if let Some(reason) = f.reason.filter(|s| *s != "all") {
+            sql.push_str(" AND t.reason = ?");
+            params.push(Box::new(reason.to_string()));
+        }
+        let order = match f.sort {
+            "repo" => "ORDER BY r.full_name, t.updated_at DESC",
+            _ => "ORDER BY t.updated_at DESC",
+        };
+        sql.push_str(order);
+
+        let mut stmt = conn.prepare(&sql).context("preparing inbox query")?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                let subject_api_url: Option<String> = row.get(7)?;
+                Ok(InboxItem {
+                    thread_id: row.get(0)?,
+                    repo: row.get(1)?,
+                    subject_type: row.get(2)?,
+                    subject_title: row.get(3)?,
+                    reason: row.get(4)?,
+                    unread: row.get::<_, i64>(5)? != 0,
+                    updated_at: row.get(6)?,
+                    subject_html_url: subject_html_url(subject_api_url.as_deref()),
+                    subject_api_url,
+                })
+            })
+            .context("querying inbox")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("reading inbox")
+    }
+
+    /// List repos that are watched or tracked by the workspace.
+    pub fn list_repos(&self, f: &RepoFilter) -> Result<Vec<RepoItem>> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let mut sql = String::from(
+            "SELECT r.full_name, r.html_url, r.is_watched, r.last_refreshed_at
+             FROM repos r WHERE (r.is_watched = 1",
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if !f.workspace_repos.is_empty() {
+            let repo_clause = in_clause(f.workspace_repos.len());
+            sql.push_str(&format!(" OR r.full_name IN {repo_clause}"));
+            for repo in f.workspace_repos {
+                params.push(Box::new(repo.clone()));
+            }
+        }
+        sql.push(')');
+        if f.show == "watched" {
+            sql.push_str(" AND r.is_watched = 1");
+        } else if f.show == "untracked" {
+            sql.push_str(" AND r.is_watched = 0");
+        }
+        if let Some(search) = f.search.filter(|s| !s.is_empty()) {
+            sql.push_str(" AND r.full_name LIKE ?");
+            params.push(Box::new(format!("%{search}%")));
+        }
+        sql.push_str(" ORDER BY r.full_name");
+
+        let workspace_set: std::collections::HashSet<&str> =
+            f.workspace_repos.iter().map(String::as_str).collect();
+        let mut stmt = conn.prepare(&sql).context("preparing repos query")?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                let full_name: String = row.get(0)?;
+                Ok(RepoItem {
+                    in_workspace: workspace_set.contains(full_name.as_str()),
+                    full_name,
+                    html_url: row.get(1)?,
+                    is_watched: row.get::<_, i64>(2)? != 0,
+                    last_refreshed_at: row.get(3)?,
+                })
+            })
+            .context("querying repos")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("reading repos")
+    }
+
+    /// The API url of an issue/PR row, if present.
+    pub fn issue_api_url(&self, id: i64) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.query_row(
+            "SELECT api_url FROM issues WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("looking up issue api_url")
+    }
+
+    /// The API url of a thread by its notification id.
+    pub fn thread_api_url(&self, thread_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.query_row(
+            "SELECT api_url FROM threads WHERE thread_id = ?1",
+            params![thread_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("looking up thread api_url")
+    }
+
+    /// Thread ids + API urls for threads whose subject matches an issue API
+    /// url (used to mark a queue item's threads read).
+    pub fn threads_for_subject(&self, subject_api_url: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let mut stmt = conn
+            .prepare("SELECT thread_id, api_url FROM threads WHERE subject_api_url = ?1")
+            .context("preparing threads_for_subject")?;
+        let rows = stmt
+            .query_map(params![subject_api_url], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .context("querying threads_for_subject")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("reading threads_for_subject row")?);
+        }
+        Ok(out)
+    }
+
+    /// Set the unread flag for a set of thread ids (dynamic IN clause).
+    pub fn set_threads_unread(&self, thread_ids: &[String], unread: bool) -> Result<()> {
+        if thread_ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let in_clause = in_clause(thread_ids.len());
+        let sql = format!(
+            "UPDATE threads SET unread = ?{} WHERE thread_id IN {in_clause}",
+            thread_ids.len() + 1
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        for id in thread_ids {
+            params.push(Box::new(id.clone()));
+        }
+        params.push(Box::new(unread));
+        conn.execute(&sql, rusqlite::params_from_iter(params.iter()))
+            .context("updating thread unread flags")?;
+        Ok(())
+    }
+
+    /// Set the unread flag for all threads in the given repos.
+    pub fn set_unread_for_repos(&self, repos: &[String], unread: bool) -> Result<()> {
+        if repos.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let in_clause = in_clause(repos.len());
+        let sql = format!(
+            "UPDATE threads SET unread = ?{}
+             WHERE repo_id IN (SELECT id FROM repos WHERE full_name IN {in_clause})",
+            repos.len() + 1
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        for repo in repos {
+            params.push(Box::new(repo.clone()));
+        }
+        params.push(Box::new(unread));
+        conn.execute(&sql, rusqlite::params_from_iter(params.iter()))
+            .context("updating unread flags for repos")?;
+        Ok(())
+    }
+
+    /// Set a repo's watched flag locally.
+    pub fn set_repo_watched(&self, full_name: &str, watched: bool) -> Result<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.execute(
+            "UPDATE repos SET is_watched = ?2 WHERE full_name = ?1",
+            params![full_name, watched],
+        )
+        .context("updating repo watched flag")?;
+        Ok(())
+    }
+
+    /// Run a closure against the guarded connection (used by cross-module
+    /// tests to run ad-hoc queries).
+    #[cfg(test)]
+    pub(crate) fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> T) -> T {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        f(&conn)
+    }
+}
+
+/// Build an `(?, ?, ...)` placeholder clause for `count` values.
+fn in_clause(count: usize) -> String {
+    let placeholders: Vec<String> = (0..count).map(|i| format!("?{}", i + 1)).collect();
+    format!("({})", placeholders.join(","))
 }
 
 /// Split an `owner/repo` full name into its parts. Falls back to treating the
@@ -326,6 +678,24 @@ fn split_repo(full_name: &str) -> (&str, &str) {
         Some((owner, name)) => (owner, name),
         None => (full_name, ""),
     }
+}
+
+/// Convert a subject API url (e.g. `https://api.github.com/repos/o/r/pulls/7`)
+/// into the corresponding github.com HTML url.
+fn subject_html_url(api: Option<&str>) -> Option<String> {
+    let api = api?;
+    let rest = api.strip_prefix("https://api.github.com/repos/")?;
+    let parts: Vec<&str> = rest.splitn(4, '/').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let (owner, repo, kind, id) = (parts[0], parts[1], parts[2], parts[3]);
+    let kind = match kind {
+        "pulls" => "pull",
+        "commits" => "commit",
+        other => other,
+    };
+    Some(format!("https://github.com/{owner}/{repo}/{kind}/{id}"))
 }
 
 #[cfg(test)]

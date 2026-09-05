@@ -1,0 +1,5 @@
+[alias]
+# Online checks (live GitHub API): ignored tests are grouped by a name-prefix
+# convention, so this only runs tests whose names start with `online_`.
+# Requires GITHUB_TOKEN or a logged-in `gh`. See docs/testing.md.
+online-checks = "test -- --ignored online_"
