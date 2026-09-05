@@ -1,14 +1,17 @@
 <div id="view" data-view="inbox">
-  <form class="filters" hx-get="/api/views/inbox" hx-target="#view" hx-swap="outerHTML"
-        hx-trigger="change, submit">
+  <form class="filters">
     <input type="hidden" name="ws" value="{{ ws }}">
-    <select name="repo_set" aria-label="Repo set">
+    <select name="repo_set" aria-label="Repo set"
+            hx-get="/api/views/inbox" hx-target="#view" hx-swap="outerHTML"
+            hx-trigger="change" hx-include="closest form">
       <option value="all" {% if repo_set == "all" %}selected{% endif %}>All repo sets</option>
       {% for set in repo_sets %}
       <option value="{{ set }}" {% if repo_set == set %}selected{% endif %}>{{ set }}</option>
       {% endfor %}
     </select>
-    <select name="type" aria-label="Type">
+    <select name="type" aria-label="Type"
+            hx-get="/api/views/inbox" hx-target="#view" hx-swap="outerHTML"
+            hx-trigger="change" hx-include="closest form">
       <option value="all" {% if subject_type == "all" %}selected{% endif %}>All types</option>
       <option value="Issue" {% if subject_type == "Issue" %}selected{% endif %}>Issue</option>
       <option value="PullRequest" {% if subject_type == "PullRequest" %}selected{% endif %}>Pull request</option>
@@ -16,7 +19,9 @@
       <option value="Discussion" {% if subject_type == "Discussion" %}selected{% endif %}>Discussion</option>
       <option value="Release" {% if subject_type == "Release" %}selected{% endif %}>Release</option>
     </select>
-    <select name="reason" aria-label="Reason">
+    <select name="reason" aria-label="Reason"
+            hx-get="/api/views/inbox" hx-target="#view" hx-swap="outerHTML"
+            hx-trigger="change" hx-include="closest form">
       <option value="all" {% if reason == "all" %}selected{% endif %}>All reasons</option>
       <option value="mention" {% if reason == "mention" %}selected{% endif %}>Mention</option>
       <option value="assign" {% if reason == "assign" %}selected{% endif %}>Assigned</option>
@@ -27,8 +32,12 @@
       <option value="security_alert" {% if reason == "security_alert" %}selected{% endif %}>Security alert</option>
       <option value="subscribed" {% if reason == "subscribed" %}selected{% endif %}>Subscribed</option>
     </select>
-    <label><input type="checkbox" name="unread" value="1" {% if unread %}checked{% endif %}> Unread only</label>
-    <select name="sort" aria-label="Sort">
+    <label><input type="checkbox" name="unread" value="1" {% if unread %}checked{% endif %}
+         hx-get="/api/views/inbox" hx-target="#view" hx-swap="outerHTML"
+         hx-trigger="change" hx-include="closest form"> Unread only</label>
+    <select name="sort" aria-label="Sort"
+            hx-get="/api/views/inbox" hx-target="#view" hx-swap="outerHTML"
+            hx-trigger="change" hx-include="closest form">
       <option value="updated" {% if sort == "updated" %}selected{% endif %}>Updated</option>
       <option value="repo" {% if sort == "repo" %}selected{% endif %}>Repo</option>
     </select>
