@@ -299,8 +299,12 @@ with the human before proceeding.
 
 - **cargo-dist**: multi-target binaries + Homebrew formula
   (tap `dmikusa/homebrew-tap`), GitHub-hosted release artifacts.
-- **OCI image**: built with the Paketo community Rust buildpack
-  (`paketocommunity/rust`); the daemon binds `0.0.0.0:$PORT` in the container.
+- **OCI image** (`oci-image.yml`): built with the Paketo community Rust
+  buildpack (`paketocommunity/rust`) and published to
+  `ghcr.io/dmikusa/github-notifications` on `v*` tags. The daemon binds
+  `127.0.0.1:$PORT` by default; containers set `HOST=0.0.0.0` to expose it
+  beyond loopback, `GHNOTIFY_CONFIG` to point at a mounted config, and
+  `GHNOTIFY_DATA_DIR` for a mounted data volume.
 
 ## Process Rules
 
@@ -319,4 +323,4 @@ with the human before proceeding.
 - [x] Phase 2 — Sync engine
 - [x] Phase 3 — UI
 - [x] Phase 4 — Extras
-- [ ] Phase 5 — Distribution
+- [x] Phase 5 — Distribution

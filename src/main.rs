@@ -38,7 +38,10 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let loaded = config::Config::load(cli.config.as_deref())?;
+    // --config wins; otherwise honor GHNOTIFY_CONFIG (useful in containers).
+    let config_path =
+        resolve_config_path(cli.config.clone(), std::env::var("GHNOTIFY_CONFIG").ok());
+    let loaded = config::Config::load(config_path.as_deref())?;
     let config = loaded.config;
 
     if config.workspaces.is_empty() {
@@ -162,6 +165,11 @@ fn parse_host(host: &str) -> IpAddr {
     }
 }
 
+/// Resolve the config path: explicit `--config`, else `GHNOTIFY_CONFIG`.
+fn resolve_config_path(cli_config: Option<PathBuf>, env_config: Option<String>) -> Option<PathBuf> {
+    cli_config.or_else(|| env_config.filter(|p| !p.is_empty()).map(PathBuf::from))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +231,28 @@ mod tests {
     fn never_opens_browser_for_non_loopback() {
         let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
         assert!(!should_open_browser(false, addr));
+    }
+
+    #[test]
+    fn config_path_prefers_cli_over_env() {
+        let cli = Some(PathBuf::from("/cli/config.toml"));
+        assert_eq!(
+            resolve_config_path(cli.clone(), Some("/env/config.toml".into())),
+            cli
+        );
+    }
+
+    #[test]
+    fn config_path_uses_env_when_no_cli() {
+        assert_eq!(
+            resolve_config_path(None, Some("/env/config.toml".into())),
+            Some(PathBuf::from("/env/config.toml"))
+        );
+    }
+
+    #[test]
+    fn config_path_ignores_empty_env() {
+        assert_eq!(resolve_config_path(None, Some(String::new())), None);
+        assert_eq!(resolve_config_path(None, None), None);
     }
 }

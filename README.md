@@ -1,5 +1,8 @@
 # github-notifications
 
+![License](https://img.shields.io/badge/license-GPL--2.0--or--later-blue.svg)
+[![CI](https://github.com/dmikusa/github-notifications/actions/workflows/ci.yml/badge.svg)](https://github.com/dmikusa/github-notifications/actions/workflows/ci.yml)
+
 A local web app for managing GitHub notifications. It polls the GitHub
 notifications API, caches everything locally in SQLite, and gives you fast,
 filterable, workspace-based views of your open issues, PRs, and notification
@@ -15,6 +18,8 @@ threads — beyond what github.com/notifications supports.
   unread, reason, and more.
 - **Bulk actions**: select many, then mark read/unread, dismiss, mute, watch or
   unwatch repos.
+- **Repo set management**: browse an org, checkbox-select repos, and save a
+  repo set — all from the UI (Settings tab).
 - **Opt-in auto-dismiss** of closed+merged PR notifications.
 - **Single binary**: the web UI is embedded; no runtime or build step.
 
@@ -31,6 +36,25 @@ $ github-notifications
 Follow [docs/setup.md](docs/setup.md) to configure GitHub authentication
 (classic PAT, gh-token reuse, or OAuth device flow) and add workspaces/repo
 sets.
+
+## Container
+
+Prebuilt images are published to GHCR (`ghcr.io/dmikusa/github-notifications`)
+when a `v*` tag is pushed, built with the Paketo Rust buildpack.
+
+```console
+$ docker run -p 8080:8080 \
+    -e HOST=0.0.0.0 \
+    -e GHNOTIFY_CONFIG=/app/config.toml \
+    -v "$PWD/config.toml:/app/config.toml" \
+    -e GHNOTIFY_DATA_DIR=/data \
+    -v notify-data:/data \
+    ghcr.io/dmikusa/github-notifications:latest
+```
+
+The container listens on `127.0.0.1` by default; set `HOST=0.0.0.0` to expose
+it beyond loopback. Point `GHNOTIFY_CONFIG` at a mounted config file that has a
+workspace + repo set, and mount a volume for the SQLite data directory.
 
 ## Development
 
