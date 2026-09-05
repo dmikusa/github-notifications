@@ -39,17 +39,11 @@ struct QueueTemplate<'a> {
     q: &'a str,
     sort: &'a str,
     items: &'a [db::QueueItem],
-    synced: bool,
 }
 
-/// Render the queue view fragment for `workspace`. `synced` reports whether the
-/// cache has been populated by at least one completed sync.
-pub fn render_queue(
-    db: &Database,
-    workspace: &Workspace,
-    q: &QueueParams,
-    synced: bool,
-) -> Result<String> {
+/// Render the queue view fragment for `workspace`. Rows only; the frontend
+/// decides how to present the initial-loading state via `/api/sync/status`.
+pub fn render_queue(db: &Database, workspace: &Workspace, q: &QueueParams) -> Result<String> {
     let repos = workspace.tracked_repos();
     let filter = db::QueueFilter {
         repos: &repos,
@@ -70,7 +64,6 @@ pub fn render_queue(
         q: &q.q,
         sort: &q.sort,
         items: &items,
-        synced,
     };
     template.render().context("rendering queue view")
 }
@@ -84,16 +77,10 @@ struct InboxTemplate<'a> {
     unread: bool,
     sort: &'a str,
     items: &'a [db::InboxItem],
-    synced: bool,
 }
 
 /// Render the inbox view fragment for `workspace`.
-pub fn render_inbox(
-    db: &Database,
-    workspace: &Workspace,
-    q: &InboxParams,
-    synced: bool,
-) -> Result<String> {
+pub fn render_inbox(db: &Database, workspace: &Workspace, q: &InboxParams) -> Result<String> {
     let repos = workspace.tracked_repos();
     let filter = db::InboxFilter {
         repos: &repos,
@@ -110,7 +97,6 @@ pub fn render_inbox(
         unread: q.unread,
         sort: &q.sort,
         items: &items,
-        synced,
     };
     template.render().context("rendering inbox view")
 }
@@ -122,16 +108,10 @@ struct ReposTemplate<'a> {
     show: &'a str,
     q: &'a str,
     items: &'a [db::RepoItem],
-    synced: bool,
 }
 
 /// Render the repos view fragment for `workspace`.
-pub fn render_repos(
-    db: &Database,
-    workspace: &Workspace,
-    q: &RepoParams,
-    synced: bool,
-) -> Result<String> {
+pub fn render_repos(db: &Database, workspace: &Workspace, q: &RepoParams) -> Result<String> {
     let filter = db::RepoFilter {
         workspace_repos: &workspace.tracked_repos(),
         show: &q.show,
@@ -143,7 +123,6 @@ pub fn render_repos(
         show: &q.show,
         q: &q.q,
         items: &items,
-        synced,
     };
     template.render().context("rendering repos view")
 }
@@ -249,7 +228,6 @@ mod tests {
                 q: String::new(),
                 sort: "attention".into(),
             },
-            true,
         )
         .expect("render");
         assert!(html.contains("an open issue"));
@@ -257,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_renders_not_populated_empty_state() {
+    fn queue_renders_empty_state() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = Database::open(&dir.path().join("data.db")).expect("db");
         let ws = Workspace {
@@ -268,7 +246,6 @@ mod tests {
             }],
             ..Default::default()
         };
-        // A fresh DB with no last_sync should say "no data yet".
         let html = render_queue(
             &db,
             &ws,
@@ -279,27 +256,9 @@ mod tests {
                 q: String::new(),
                 sort: "attention".into(),
             },
-            false,
-        )
-        .expect("render");
-        assert!(html.contains("No data yet"));
-
-        // Once synced, an empty result is a normal filtered-empty message.
-        let html = render_queue(
-            &db,
-            &ws,
-            &QueueParams {
-                ws: "w".into(),
-                kind: "all".into(),
-                unread: false,
-                q: String::new(),
-                sort: "attention".into(),
-            },
-            true,
         )
         .expect("render");
         assert!(html.contains("No items match your filters"));
-        assert!(!html.contains("No data yet"));
     }
 
     #[test]
@@ -325,7 +284,6 @@ mod tests {
                 unread: false,
                 sort: "updated".into(),
             },
-            true,
         )
         .expect("render");
         assert!(html.contains("an open issue"));

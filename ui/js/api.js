@@ -2,10 +2,14 @@
 window.App = window.App || {};
 
 window.App.api = (() => {
-  async function getState() {
-    const res = await fetch('/api/state');
-    if (!res.ok) throw new Error(`GET /api/state failed: ${res.status}`);
+  async function getJSON(url) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`GET ${url} failed: ${res.status}`);
     return res.json();
+  }
+
+  async function getState() {
+    return getJSON('/api/state');
   }
 
   async function getView(view, params) {
@@ -25,5 +29,5 @@ window.App.api = (() => {
     return res.json();
   }
 
-  return { getState, getView, postJSON };
+  return { getJSON, getState, getView, postJSON };
 })();
