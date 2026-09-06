@@ -10,7 +10,9 @@ use tokio::sync::mpsc;
 use crate::config::Config;
 use crate::db::Database;
 use crate::github::{self, next_link, Client, RateLimit};
-use crate::models::{GithubIssue, GithubPullRequest, NotificationThread, WatchedRepo};
+use crate::models::{
+    GithubIssue, GithubPullRequest, NotificationThread, RepoSubscription, WatchedRepo,
+};
 
 /// Live view of sync state shared with the API handlers.
 #[derive(Debug, Clone, Default)]
@@ -139,6 +141,7 @@ async fn sync_once(
     if repo_due {
         sync_repos(client, db, status, config).await?;
         sync_watches(client, db, status).await?;
+        sync_repo_subscriptions(client, db, status, config).await?;
         db.set_sync_state("last_repo_refresh", &now)?;
     }
 
@@ -291,34 +294,114 @@ async fn sync_watches(
     db: &Database,
     status: &Arc<Mutex<SyncStatus>>,
 ) -> Result<()> {
-    db.clear_watched()?;
+    let etag_key = "etag:subscriptions";
+    let etag = db.get_sync_state(etag_key)?;
     let mut page_url: Option<String> = None;
+    let mut first = true;
     loop {
         let response = match &page_url {
             Some(url) => client.get_url(url, None).await?,
             None => {
                 client
-                    .get("/user/subscriptions", &[("per_page", "100")], None)
+                    .get(
+                        "/user/subscriptions",
+                        &[("per_page", "100")],
+                        if first { etag.as_deref() } else { None },
+                    )
                     .await?
             }
         };
 
         record_rate_limit(status, &response.headers);
 
+        if response.status == axum::http::StatusCode::NOT_MODIFIED {
+            // The watched list is unchanged; keep the existing flags.
+            break;
+        }
         if response.status != axum::http::StatusCode::OK {
             return Err(anyhow::anyhow!(
                 "subscriptions endpoint returned {}",
                 response.status
             ));
         }
+
+        // Only reset the flags once we have a fresh list.
+        if first {
+            db.clear_watched()?;
+        }
         let repos: Vec<WatchedRepo> =
             serde_json::from_slice(&response.body).context("parsing subscriptions response")?;
         for repo in &repos {
             db.upsert_watched_repo(&repo.full_name, &repo.html_url)?;
         }
+
+        if first {
+            if let Some(etag) = response.headers.get("etag").and_then(|v| v.to_str().ok()) {
+                db.set_sync_state(etag_key, etag)?;
+            }
+        }
+
         page_url = next_link(&response.headers);
+        first = false;
         if page_url.is_none() {
             break;
+        }
+    }
+    Ok(())
+}
+
+/// Refresh the per-repo subscription state (`ignored` vs `participating`) for
+/// every tracked repo. Watched repos are skipped — the watched list already
+/// knows them. Unchanged subscriptions return 304 and only bump the check
+/// time; a 404 means "participating and @mentions" (no explicit subscription).
+async fn sync_repo_subscriptions(
+    client: &Client,
+    db: &Database,
+    status: &Arc<Mutex<SyncStatus>>,
+    config: &Config,
+) -> Result<()> {
+    for full_name in tracked_repos(config) {
+        let Some((owner, name)) = full_name.split_once('/') else {
+            continue;
+        };
+        if db.is_repo_watched(&full_name)? {
+            continue;
+        }
+        db.upsert_repo(&full_name, Some(&format!("https://github.com/{full_name}")))?;
+
+        let etag = db.repo_subscription_etag(&full_name)?;
+        let path = format!("/repos/{owner}/{name}/subscription");
+        let response = client.get(&path, &[], etag.as_deref()).await?;
+        record_rate_limit(status, &response.headers);
+
+        let checked_at = now_utc();
+        match response.status {
+            axum::http::StatusCode::NOT_MODIFIED => {
+                db.touch_repo_subscription(&full_name, &checked_at)?;
+            }
+            axum::http::StatusCode::OK => {
+                let sub: RepoSubscription = serde_json::from_slice(&response.body)
+                    .with_context(|| format!("parsing subscription for {full_name}"))?;
+                let state = if sub.ignored {
+                    "ignored"
+                } else if sub.subscribed {
+                    "watched"
+                } else {
+                    "participating"
+                };
+                let etag = response
+                    .headers
+                    .get("etag")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                db.set_repo_subscription(&full_name, state, etag.as_deref(), &checked_at)?;
+            }
+            axum::http::StatusCode::NOT_FOUND => {
+                db.set_repo_subscription(&full_name, "participating", None, &checked_at)?;
+            }
+            other => {
+                tracing::warn!("skipping {full_name}: subscription endpoint returned {other}");
+            }
         }
     }
     Ok(())
@@ -604,6 +687,158 @@ mod tests {
         assert_eq!(db.count("threads").expect("count"), 2);
         // Auto-dismiss marks the merged PR thread read; the issue thread stays.
         assert_eq!(db.unread_thread_count().expect("unread"), 1);
+    }
+
+    #[tokio::test]
+    async fn sync_repo_subscriptions_caches_states() {
+        use axum::response::IntoResponse;
+        use axum::{routing::get, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+
+        // o/r is in the watched list; o/ignored is explicitly ignored; o/plain
+        // has no subscription (404 => participating).
+        let ignored_calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/notifications",
+                get(|| async { ([("ETag", "\"n1\"")], r#"[]"#).into_response() }),
+            )
+            .route(
+                "/user/subscriptions",
+                get({
+                    let seen = std::sync::Arc::new(Mutex::new(false));
+                    move || {
+                        let seen = seen.clone();
+                        async move {
+                            if *seen.lock().expect("seen") {
+                                return axum::http::StatusCode::NOT_MODIFIED.into_response();
+                            }
+                            *seen.lock().expect("seen") = true;
+                            (
+                                [("ETag", "\"w1\"")],
+                                r#"[{"full_name":"o/r","html_url":"https://github.com/o/r"}]"#,
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/repos/o/ignored/subscription",
+                get({
+                    let calls = ignored_calls.clone();
+                    move |req: axum::http::Request<axum::body::Body>| {
+                        let calls = calls.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            let inm = req
+                                .headers()
+                                .get("if-none-match")
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_string);
+                            if inm.as_deref() == Some("\"ig1\"") {
+                                axum::http::StatusCode::NOT_MODIFIED.into_response()
+                            } else {
+                                (
+                                    [("ETag", "\"ig1\"")],
+                                    r#"{"subscribed":false,"ignored":true}"#,
+                                )
+                                    .into_response()
+                            }
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/repos/o/plain/subscription",
+                get(|| async { axum::http::StatusCode::NOT_FOUND.into_response() }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("db");
+        let config = Config {
+            github: crate::config::GithubConfig {
+                auth_provider: crate::config::AuthProvider::Pat,
+                auth_token: "ghp_x".into(),
+                poll_interval_seconds: 60,
+                repo_refresh_interval_seconds: 60,
+                ..Default::default()
+            },
+            workspaces: vec![crate::config::Workspace {
+                name: "test".into(),
+                auto_dismiss_closed_merged: false,
+                repo_sets: vec![crate::config::RepoSet {
+                    name: "set".into(),
+                    repos: vec!["o/r".into(), "o/ignored".into(), "o/plain".into()],
+                }],
+            }],
+        };
+        let client = Client::with_base(
+            Arc::new(crate::auth::pat::ClassicPat::new("ghp_x".into())),
+            &base,
+        );
+        let status = Arc::new(Mutex::new(SyncStatus::default()));
+
+        sync_once(&client, &db, &config, &status, true)
+            .await
+            .expect("first sync");
+
+        let states: Vec<(String, String)> = db
+            .list_repos(&crate::db::RepoFilter {
+                workspace_repos: &["o/r".into(), "o/ignored".into(), "o/plain".into()],
+                show: "all",
+                search: None,
+            })
+            .expect("list")
+            .into_iter()
+            .map(|i| (i.full_name, i.subscription_state.unwrap_or_default()))
+            .collect();
+        assert!(states.iter().any(|(n, s)| n == "o/r" && s == "watched"));
+        assert!(states
+            .iter()
+            .any(|(n, s)| n == "o/ignored" && s == "ignored"));
+        assert!(states
+            .iter()
+            .any(|(n, s)| n == "o/plain" && s == "participating"));
+        // The watched list ETag and the ignored repo's subscription ETag are cached.
+        assert_eq!(
+            db.get_sync_state("etag:subscriptions")
+                .expect("etag")
+                .as_deref(),
+            Some("\"w1\"")
+        );
+        assert_eq!(
+            db.repo_subscription_etag("o/ignored")
+                .expect("etag")
+                .as_deref(),
+            Some("\"ig1\"")
+        );
+
+        // Second pass: /user/subscriptions is unchanged (304) so watched flags
+        // are kept, and o/ignored is unchanged (304) so its state is kept.
+        sync_once(&client, &db, &config, &status, true)
+            .await
+            .expect("second sync");
+        assert!(db.is_repo_watched("o/r").expect("watched"));
+        assert_eq!(
+            db.repo_subscription_etag("o/ignored")
+                .expect("etag")
+                .as_deref(),
+            Some("\"ig1\"")
+        );
+        assert_eq!(
+            ignored_calls.load(Ordering::SeqCst),
+            2,
+            "one full fetch + one 304"
+        );
     }
 
     #[tokio::test]

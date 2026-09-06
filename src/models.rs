@@ -69,6 +69,16 @@ pub struct WatchedRepo {
     pub html_url: String,
 }
 
+/// The authenticated user's subscription for a repository
+/// (`GET /repos/{owner}/{repo}/subscription`).
+#[derive(Debug, Deserialize)]
+pub struct RepoSubscription {
+    #[serde(default)]
+    pub subscribed: bool,
+    #[serde(default)]
+    pub ignored: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

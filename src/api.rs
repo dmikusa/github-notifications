@@ -56,6 +56,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/threads/mute", post(thread_mute))
         .route("/api/repos/{owner}/{repo}/watch", post(repo_watch))
         .route("/api/repos/{owner}/{repo}/unwatch", post(repo_unwatch))
+        .route("/api/repos/{owner}/{repo}/ignore", post(repo_ignore))
+        .route("/api/repos/{owner}/{repo}/unignore", post(repo_unignore))
         .route("/api/workspaces/{name}/repo-sets", get(workspace_repo_sets))
         .route("/api/workspaces/{name}/repo-sets", post(repo_set_create))
         .route(
@@ -394,6 +396,7 @@ async fn repo_watch(
             .await?;
         ensure_success(&res.status, "watch repo")?;
         state.db.set_repo_watched(&full, true)?;
+        state.db.set_repo_subscription_state(&full, "watched")?;
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -412,6 +415,52 @@ async fn repo_unwatch(
             .await?;
         ensure_success(&res.status, "unwatch repo")?;
         state.db.set_repo_watched(&full, false)?;
+        state
+            .db
+            .set_repo_subscription_state(&full, "participating")?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    json_response(result)
+}
+
+async fn repo_ignore(
+    State(state): State<AppState>,
+    Path((owner, repo)): Path<(String, String)>,
+) -> Response {
+    let full = format!("{owner}/{repo}");
+    let result = async {
+        let res = state
+            .github
+            .put_json(
+                &format!("/repos/{owner}/{repo}/subscription"),
+                serde_json::json!({ "subscribed": false, "ignored": true }),
+            )
+            .await?;
+        ensure_success(&res.status, "ignore repo")?;
+        state.db.set_repo_watched(&full, false)?;
+        state.db.set_repo_subscription_state(&full, "ignored")?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    json_response(result)
+}
+
+async fn repo_unignore(
+    State(state): State<AppState>,
+    Path((owner, repo)): Path<(String, String)>,
+) -> Response {
+    let full = format!("{owner}/{repo}");
+    let result = async {
+        let res = state
+            .github
+            .delete(&format!("/repos/{owner}/{repo}/subscription"))
+            .await?;
+        ensure_success(&res.status, "unignore repo")?;
+        state.db.set_repo_watched(&full, false)?;
+        state
+            .db
+            .set_repo_subscription_state(&full, "participating")?;
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -518,10 +567,13 @@ async fn org_repos(
     let result = async {
         let page = params.page.unwrap_or(1).max(1);
         let q = params.q.unwrap_or_default();
+        // Forgiving input: a trailing slash (e.g. "dmikusa/") is not part of
+        // the account name.
+        let org = org.trim_end_matches('/');
 
-        // The org's repo list is identical for every workspace, so cache it
-        // once per org and reuse it across workspaces. Only refetch when the
-        // cached copy is stale (same cadence as the repo refresh interval).
+        // The account's repo list is identical for every workspace, so cache
+        // it once per account and reuse it across workspaces. Only refetch when
+        // the cached copy is stale (same cadence as the repo refresh interval).
         let cache_key = format!("org_repos:{org}");
         let last = state.db.get_sync_state(&cache_key)?;
         let refresh_interval = state
@@ -531,14 +583,14 @@ async fn org_repos(
             .github
             .repo_refresh_interval_seconds;
         if sync::due(&last, refresh_interval) {
-            let repos = fetch_all_org_repos(&state.github, &org).await?;
-            state.db.replace_org_repos(&org, &repos)?;
+            let repos = fetch_all_org_repos(&state.github, org).await?;
+            state.db.replace_org_repos(org, &repos)?;
             state.db.set_sync_state(&cache_key, &sync::now_utc())?;
         }
 
         // Search is served from the cached list (a name filter), so once an
-        // org's repos are cached the org browser works instantly and offline.
-        let all = state.db.list_org_repos(&org, &q)?;
+        // account's repos are cached the browser works instantly and offline.
+        let all = state.db.list_org_repos(org, &q)?;
         let per_page = 100usize;
         let start = (page as usize - 1) * per_page;
         let mut repos = Vec::new();
@@ -560,23 +612,41 @@ async fn org_repos(
     json_response(result)
 }
 
-/// Fetch every repo in an org by paging through `GET /orgs/{org}/repos`.
+/// Fetch every repo for an org or user account by paging through the
+/// repositories endpoint. A 404 on the org endpoint falls back to the user
+/// account endpoint, so personal accounts ("dmikusa") work too.
 async fn fetch_all_org_repos(
     client: &github::Client,
-    org: &str,
+    account: &str,
+) -> Result<Vec<models::WatchedRepo>, anyhow::Error> {
+    let endpoints = [
+        format!("/orgs/{account}/repos"),
+        format!("/users/{account}/repos"),
+    ];
+    let mut last_err = None;
+    for path in &endpoints {
+        match fetch_repos_paginated(client, path).await {
+            Ok(repos) => return Ok(repos),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err
+        .map(|e| anyhow::anyhow!("no repos found for {account}: {e}"))
+        .unwrap_or_else(|| anyhow::anyhow!("no repos found for {account}")))
+}
+
+async fn fetch_repos_paginated(
+    client: &github::Client,
+    path: &str,
 ) -> Result<Vec<models::WatchedRepo>, anyhow::Error> {
     let mut repos = Vec::new();
     let mut page_url: Option<String> = None;
     loop {
         let response = match &page_url {
             Some(url) => client.get_url(url, None).await?,
-            None => {
-                client
-                    .get(&format!("/orgs/{org}/repos"), &[("per_page", "100")], None)
-                    .await?
-            }
+            None => client.get(path, &[("per_page", "100")], None).await?,
         };
-        ensure_success(&response.status, "list org repos")?;
+        ensure_success(&response.status, &format!("list repos at {path}"))?;
         let page: Vec<models::WatchedRepo> = serde_json::from_slice(&response.body)?;
         repos.extend(page);
         page_url = next_link(&response.headers);
@@ -901,6 +971,14 @@ mod tests {
             .route(
                 "/user/subscriptions/o/r",
                 delete(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/repos/o/r/subscription",
+                put(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/repos/o/r/subscription",
+                delete(|| async { StatusCode::NO_CONTENT }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1012,6 +1090,15 @@ mod tests {
             .expect("watched")
         });
         assert_eq!(watched, 1);
+        let state = db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT subscription_state FROM repos WHERE full_name='o/r'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .expect("state")
+        });
+        assert_eq!(state, "watched");
 
         let response = app
             .clone()
@@ -1034,6 +1121,72 @@ mod tests {
             .expect("watched")
         });
         assert_eq!(watched, 0);
+
+        // The cached per-repo subscription state tracks the action.
+        let state = db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT subscription_state FROM repos WHERE full_name='o/r'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .expect("state")
+        });
+        assert_eq!(state, "participating");
+    }
+
+    #[tokio::test]
+    async fn repo_ignore_and_unignore_update_local_state() {
+        let (base, _patch_calls) = mock_github_actions().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(Database::open(&dir.path().join("data.db")).expect("db"));
+        db.upsert_repo("o/r", Some("https://github.com/o/r"))
+            .expect("repo");
+
+        let client = github::Client::with_base(Arc::new(ClassicPat::new("ghp_x".into())), &base);
+        let app = router(state_with_client(db.clone(), client));
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/repos/o/r/ignore")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::OK);
+        let (watched, state) = db.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT is_watched, subscription_state FROM repos WHERE full_name='o/r'")
+                .expect("prepare");
+            stmt.query_row([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+                .expect("row")
+        });
+        assert_eq!(watched, 0);
+        assert_eq!(state, "ignored");
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/repos/o/r/unignore")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::OK);
+        let state = db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT subscription_state FROM repos WHERE full_name='o/r'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .expect("state")
+        });
+        assert_eq!(state, "participating");
     }
 
     fn state_with_config_file(body: &str) -> (AppState, tempfile::TempDir) {
@@ -1307,5 +1460,105 @@ mod tests {
         assert!(body.contains("o/repo-001"));
         assert!(!body.contains("o/repo-002"));
         assert!(body.contains("\"has_more\":false"));
+    }
+
+    #[tokio::test]
+    async fn org_repos_falls_back_to_user_endpoint() {
+        use axum::routing::get;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let app = Router::new()
+            .route(
+                "/orgs/o/repos",
+                get(|| async { axum::http::StatusCode::NOT_FOUND }),
+            )
+            .route(
+                "/users/o/repos",
+                get(|| async {
+                    (
+                        [("ETag", "\"u1\"")],
+                        r#"[
+                        {"full_name":"o/repo-a","html_url":"https://github.com/o/repo-a"},
+                        {"full_name":"o/repo-b","html_url":"https://github.com/o/repo-b"}
+                    ]"#,
+                    )
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(Database::open(&dir.path().join("data.db")).expect("db"));
+        let client = github::Client::with_base(Arc::new(ClassicPat::new("ghp_x".into())), &base);
+        let app = router(state_with_client(db, client));
+
+        // "o" is not an org, so the handler falls back to the user endpoint.
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/orgs/o/repos")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("o/repo-a"));
+        assert!(body.contains("o/repo-b"));
+    }
+
+    #[tokio::test]
+    async fn org_repos_strips_trailing_slash() {
+        use axum::routing::get;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let app = Router::new().route(
+            "/orgs/o/repos",
+            get(|| async {
+                r#"[{"full_name":"o/repo-a","html_url":"https://github.com/o/repo-a"}]"#
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(Database::open(&dir.path().join("data.db")).expect("db"));
+        let client = github::Client::with_base(Arc::new(ClassicPat::new("ghp_x".into())), &base);
+        let app = router(state_with_client(db, client));
+
+        // "o/" must be normalized to "o" before hitting the org endpoint.
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/orgs/o%2F/repos")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("o/repo-a"));
     }
 }

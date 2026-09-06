@@ -201,6 +201,10 @@ td.empty {
   padding: 1.5rem;
 }
 
+.repo-list .empty.error {
+  color: var(--danger);
+}
+
 .spinner {
   display: inline-block;
   width: 14px;
@@ -364,6 +368,11 @@ dialog input {
 .badge.ok {
   background: #dafbe1;
   color: var(--ok);
+}
+
+.badge.ignored {
+  background: #ffebe9;
+  color: var(--danger);
 }
 
 .bulk-bar {

@@ -480,4 +480,45 @@ mod tests {
         assert!(!html.contains(r"\u2014"));
         assert!(html.contains("&mdash;"));
     }
+
+    #[test]
+    fn repos_renders_subscription_badges() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("db");
+        for (full, watched, state) in [
+            ("a/w", true, Some("watched")),
+            ("a/i", false, Some("ignored")),
+            ("a/p", false, Some("participating")),
+        ] {
+            db.upsert_repo(full, Some(&format!("https://github.com/{full}")))
+                .expect("repo");
+            db.set_repo_watched(full, watched).expect("watched");
+            if let Some(s) = state {
+                db.set_repo_subscription_state(full, s).expect("state");
+            }
+        }
+        let ws = Workspace {
+            name: "w".into(),
+            repo_sets: vec![RepoSet {
+                name: "s".into(),
+                repos: vec!["a/w".into(), "a/i".into(), "a/p".into()],
+            }],
+            ..Default::default()
+        };
+        let html = render_repos(
+            &db,
+            &ws,
+            &RepoParams {
+                ws: "w".into(),
+                show: "all".into(),
+                q: String::new(),
+            },
+        )
+        .expect("render");
+        assert!(html.contains("class=\"badge ok\">watched"));
+        assert!(html.contains("class=\"badge ignored\">ignored"));
+        assert!(html.contains("class=\"badge\">participating"));
+        // The ignored filter option is present.
+        assert!(html.contains("value=\"ignored\""));
+    }
 }

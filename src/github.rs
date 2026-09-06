@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use axum::http::StatusCode;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, IF_NONE_MATCH, LINK, USER_AGENT};
+use reqwest::header::{
+    HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE, IF_NONE_MATCH, LINK, USER_AGENT,
+};
 use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
@@ -80,6 +82,7 @@ impl Client {
         url: &str,
         params: &[(&str, &str)],
         etag: Option<&str>,
+        body: Option<String>,
     ) -> Result<GitResponse, ClientError> {
         let mut attempt = 0;
         loop {
@@ -102,6 +105,11 @@ impl Client {
             }
             if let Some(e) = etag {
                 builder = builder.header(IF_NONE_MATCH, e);
+            }
+            if let Some(body) = &body {
+                builder = builder
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(body.clone());
             }
             let response = builder.send().await?;
             let status = response.status();
@@ -128,34 +136,50 @@ impl Client {
         params: &[(&str, &str)],
         etag: Option<&str>,
     ) -> Result<GitResponse, ClientError> {
-        self.request("GET", &format!("{}{}", self.base, path), params, etag)
+        self.request("GET", &format!("{}{}", self.base, path), params, etag, None)
             .await
     }
 
     /// Authenticated `GET` to an absolute URL (e.g. a `Link` page or a subject
     /// URL from a notification thread).
     pub async fn get_url(&self, url: &str, etag: Option<&str>) -> Result<GitResponse, ClientError> {
-        self.request("GET", url, &[], etag).await
+        self.request("GET", url, &[], etag, None).await
     }
 
     /// Authenticated `PATCH` to a path under the API base URL (e.g. marking a
     /// thread read).
     pub async fn patch(&self, path: &str) -> Result<GitResponse, ClientError> {
-        self.request("PATCH", &format!("{}{}", self.base, path), &[], None)
+        self.request("PATCH", &format!("{}{}", self.base, path), &[], None, None)
             .await
     }
 
     /// Authenticated `PUT` to a path under the API base URL (e.g. marking all
     /// notifications read).
     pub async fn put(&self, path: &str) -> Result<GitResponse, ClientError> {
-        self.request("PUT", &format!("{}{}", self.base, path), &[], None)
+        self.request("PUT", &format!("{}{}", self.base, path), &[], None, None)
             .await
+    }
+
+    /// Authenticated `PUT` with a JSON body (e.g. setting a repo subscription).
+    pub async fn put_json(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<GitResponse, ClientError> {
+        self.request(
+            "PUT",
+            &format!("{}{}", self.base, path),
+            &[],
+            None,
+            Some(body.to_string()),
+        )
+        .await
     }
 
     /// Authenticated `DELETE` to a path under the API base URL (e.g. unsubscribing
     /// from a thread).
     pub async fn delete(&self, path: &str) -> Result<GitResponse, ClientError> {
-        self.request("DELETE", &format!("{}{}", self.base, path), &[], None)
+        self.request("DELETE", &format!("{}{}", self.base, path), &[], None, None)
             .await
     }
 
