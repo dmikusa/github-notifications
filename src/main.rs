@@ -25,18 +25,24 @@ struct Cli {
     /// Do not open the web UI in the default browser after starting
     #[arg(long)]
     no_open: bool,
+
+    /// Enable debug logging (more detail, plus HTTP request tracing).
+    /// Overridden by the RUST_LOG environment variable when set.
+    #[arg(long)]
+    debug: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    let default_level = if cli.debug { "debug" } else { "info" };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level)),
         )
         .init();
-
-    let cli = Cli::parse();
 
     // --config wins; otherwise honor GHNOTIFY_CONFIG (useful in containers).
     let config_path =

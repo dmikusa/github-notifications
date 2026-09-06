@@ -111,10 +111,24 @@ impl Client {
                     .header(CONTENT_TYPE, "application/json")
                     .body(body.clone());
             }
-            let response = builder.send().await?;
+            let start = std::time::Instant::now();
+            let response = match builder.send().await {
+                Ok(response) => response,
+                Err(e) => {
+                    tracing::debug!(method, url, error = %e, "github api request failed");
+                    return Err(e.into());
+                }
+            };
             let status = response.status();
             let headers = response.headers().clone();
             let body = response.bytes().await?.to_vec();
+            tracing::debug!(
+                method,
+                url,
+                status = %status,
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "github api request"
+            );
 
             if status == StatusCode::UNAUTHORIZED && attempt == 0 {
                 self.token.refresh().await?;

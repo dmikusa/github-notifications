@@ -46,17 +46,23 @@ window.App.views = (() => {
   }
 
   async function load(view) {
+    // Remember the outgoing view's filters before the DOM is replaced.
+    window.App.filters.capture(window.App.state.currentView);
     window.App.state.currentView = view;
     document.querySelectorAll('#tabs .tab').forEach((t) => {
       t.classList.toggle('active', t.dataset.view === view);
     });
-    const html = await window.App.api.getView(view, params());
+    const html = await window.App.api.getView(view, {
+      ...params(),
+      ...window.App.filters.forView(view),
+    });
     const el = document.getElementById('view');
     el.outerHTML = html;
     // The view was swapped outside of an htmx transaction, so htmx never
     // processed the new elements (filter controls, etc.). Register them now.
     const newEl = document.getElementById('view');
     if (newEl && window.htmx) htmx.process(newEl);
+    window.App.filters.capture(view);
     window.App.table.bind();
     if (view === 'settings') {
       window.App.settings.bind();
@@ -280,4 +286,5 @@ async function refreshStatusLine() {
 
 document.addEventListener('htmx:afterSwap', () => {
   window.App.table.bind();
+  window.App.filters.capture(window.App.state.currentView);
 });

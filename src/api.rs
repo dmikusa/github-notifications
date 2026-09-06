@@ -75,7 +75,25 @@ pub fn router(state: AppState) -> Router {
             post(dismiss_closed_merged),
         )
         .fallback(static_handler)
+        .layer(axum::middleware::from_fn(log_requests))
         .with_state(state)
+}
+
+/// Debug-level access log for incoming HTTP requests: method, path, status,
+/// and duration. Emitted at `debug` so it only appears in debug mode.
+async fn log_requests(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let start = std::time::Instant::now();
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let response = next.run(request).await;
+    tracing::debug!(
+        method = %method,
+        uri = %uri,
+        status = %response.status(),
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "http request"
+    );
+    response
 }
 
 async fn root(State(state): State<AppState>) -> Response {
