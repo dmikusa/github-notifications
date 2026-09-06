@@ -71,6 +71,11 @@ body {
   cursor: pointer;
 }
 
+#sync:disabled {
+  cursor: not-allowed;
+  opacity: 0.75;
+}
+
 .status {
   padding: 0.35rem 1.25rem;
   font-size: 12px;

@@ -107,22 +107,56 @@ function populateWorkspaces(state) {
   }
 }
 
+function renderStatusLine(state) {
+  const auth = state.auth;
+  let text = `auth: ${auth.provider}`;
+  if (auth.ok) {
+    text += ` as ${auth.login || 'unknown'}`;
+  } else {
+    text += ` (${auth.missing.join(', ') || 'unconfigured'})`;
+  }
+  if (state.sync.last_sync) text += ` \u00b7 last sync ${formatLocalTime(state.sync.last_sync)}`;
+  window.App.status.set(text);
+  window.App.notice.update(state.sync);
+}
+
+/// Format an RFC3339 timestamp (from the API) in the user's local timezone,
+/// e.g. `2026-09-06 13:30:41 EST`.
+function formatLocalTime(iso) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return iso;
+  const pad = (n) => String(n).padStart(2, '0');
+  const y = date.getFullYear();
+  const mo = pad(date.getMonth() + 1);
+  const d = pad(date.getDate());
+  const h = pad(date.getHours());
+  const mi = pad(date.getMinutes());
+  const s = pad(date.getSeconds());
+  const tz =
+    new Intl.DateTimeFormat('en-US', { timeZoneName: 'short' })
+      .formatToParts(date)
+      .find((p) => p.type === 'timeZoneName')?.value ?? '';
+  return `${y}-${mo}-${d} ${h}:${mi}:${s} ${tz}`;
+}
+
+async function refreshStatusLine() {
+  try {
+    const state = await window.App.api.getState();
+    renderStatusLine(state);
+    return state;
+  } catch (err) {
+    window.App.status.set(`Failed to reach the daemon: ${err.message}`, true);
+    return null;
+  }
+}
+
 (async () => {
   try {
     const state = await window.App.api.getState();
     populateWorkspaces(state);
 
     const wsSel = document.getElementById('ws');
-    const auth = state.auth;
-    let authText = `auth: ${auth.provider}`;
-    if (auth.ok) {
-      authText += ` as ${auth.login || 'unknown'}`;
-    } else {
-      authText += ` (${auth.missing.join(', ') || 'unconfigured'})`;
-    }
-    if (state.sync.last_sync) authText += ` \u00b7 last sync ${state.sync.last_sync}`;
-    window.App.status.set(authText);
-    window.App.notice.update(state.sync);
+    renderStatusLine(state);
 
     document.getElementById('tabs').addEventListener('click', (e) => {
       const tab = e.target.closest('.tab');
@@ -133,8 +167,45 @@ function populateWorkspaces(state) {
       window.App.views.reload();
     });
     document.getElementById('sync').addEventListener('click', async () => {
-      await window.App.api.postJSON('/api/sync', {});
-      window.App.status.set('sync requested');
+      const btn = document.getElementById('sync');
+      if (btn.disabled) return;
+      btn.disabled = true;
+      btn.innerHTML =
+        '<span class="spinner" aria-hidden="true"></span>Syncing\u2026';
+      try {
+        // A manual sync runs in the background; poll /api/sync/status until
+        // `last_sync` advances past the value at click time (or the pass fails).
+        const before = (await window.App.api.getJSON('/api/sync/status')).last_sync;
+        await window.App.api.postJSON('/api/sync', {});
+        let outcome = { done: false, error: null };
+        for (let i = 0; i < 180 && !outcome.done; i++) {
+          await new Promise((r) => setTimeout(r, 1000));
+          const st = await window.App.api.getJSON('/api/sync/status');
+          if (st.last_sync && st.last_sync !== before) {
+            outcome.done = true;
+          } else if (!st.running && st.last_error) {
+            outcome.done = true;
+            outcome.error = st.last_error;
+          }
+        }
+        // Refresh the data table and the "last sync" line once it's done.
+        await window.App.views.reload();
+        const state = await refreshStatusLine();
+        if (outcome.error) {
+          window.App.status.set(`Sync failed: ${outcome.error}`, true);
+        } else if (!outcome.done) {
+          window.App.status.set('Sync still running \u2014 check back shortly.');
+        } else if (state?.sync?.last_sync) {
+          window.App.status.set(`Sync complete \u00b7 last sync ${formatLocalTime(state.sync.last_sync)}`);
+        } else {
+          window.App.status.set('Sync complete');
+        }
+      } catch (err) {
+        window.App.status.set(`Sync failed: ${err.message}`, true);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Sync';
+      }
     });
 
     const dialog = document.getElementById('add-ws-dialog');
