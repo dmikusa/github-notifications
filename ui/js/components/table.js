@@ -66,7 +66,7 @@ window.App.table = (() => {
         await window.App.api.postJSON('/api/threads/mark-read', { all: true, ws });
       } else if (action === 'open') {
         selectedUrls().forEach((url) => window.open(url, '_blank', 'noopener'));
-      } else if (action === 'watch' || action === 'unwatch') {
+      } else if (action === 'watch' || action === 'unwatch' || action === 'ignore' || action === 'unignore') {
         for (const repo of selected()) {
           const [owner, name] = repo.split('/');
           await window.App.api.postJSON(`/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/${action}`, {});

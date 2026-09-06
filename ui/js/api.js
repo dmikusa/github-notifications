@@ -4,7 +4,16 @@ window.App = window.App || {};
 window.App.api = (() => {
   async function getJSON(url) {
     const res = await fetch(url);
-    if (!res.ok) throw new Error(`GET ${url} failed: ${res.status}`);
+    if (!res.ok) {
+      let detail = '';
+      try {
+        const data = await res.json();
+        if (data && data.error) detail = `: ${data.error}`;
+      } catch (_) {
+        /* non-JSON error body */
+      }
+      throw new Error(`GET ${url} failed: ${res.status}${detail}`);
+    }
     return res.json();
   }
 

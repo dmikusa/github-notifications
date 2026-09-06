@@ -72,6 +72,13 @@ window.App.settings = (() => {
       if (!data.repos.length) {
         list.innerHTML = '<p class="empty">No repos match.</p>';
       }
+    } catch (err) {
+      // Don't leave the list stuck on "Loading repos…"; surface the failure.
+      list.innerHTML = '';
+      const p = document.createElement('p');
+      p.className = 'empty error';
+      p.textContent = `Couldn't load repos: ${err.message}`;
+      list.appendChild(p);
     } finally {
       setBusy(el('load-repos'), false);
       setBusy(el('load-more'), false);
@@ -117,7 +124,8 @@ window.App.settings = (() => {
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       const setname = form.elements['set-name'].value.trim();
-      org = form.elements.org.value.trim();
+      // A trailing slash is a common typo and not part of the account name.
+      org = form.elements.org.value.trim().replace(/\/+$/, '');
       if (!setname || !org) return;
       el('org-repos').hidden = false;
       el('org-filter').value = '';

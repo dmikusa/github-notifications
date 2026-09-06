@@ -86,6 +86,8 @@ pub struct RepoItem {
     pub full_name: String,
     pub html_url: String,
     pub is_watched: bool,
+    /// "watched" | "participating" | "ignored" | None (not yet checked).
+    pub subscription_state: Option<String>,
     pub in_workspace: bool,
     pub last_refreshed_at: Option<String>,
 }
@@ -95,14 +97,14 @@ pub struct RepoItem {
 pub struct RepoFilter<'a> {
     /// Repos tracked by the current workspace (determines `in_workspace`).
     pub workspace_repos: &'a [String],
-    /// "all" | "watched" | "untracked" (show mode)
+    /// "all" | "watched" | "untracked" | "ignored" (show mode)
     pub show: &'a str,
     pub search: Option<&'a str>,
 }
 
 /// Current schema version. Bump whenever the SQLite schema changes; the
 /// database is rebuilt (backed up and recreated) on mismatch.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 impl Database {
     /// Open (creating if needed) the database at `path` and initialize the
@@ -170,7 +172,10 @@ CREATE TABLE IF NOT EXISTS repos (
     name             TEXT NOT NULL,
     html_url         TEXT,
     is_watched       INTEGER NOT NULL DEFAULT 0,
-    last_refreshed_at TEXT
+    last_refreshed_at TEXT,
+    subscription_state   TEXT,
+    subscription_etag    TEXT,
+    subscription_checked_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS issues (
@@ -440,11 +445,16 @@ CREATE TABLE IF NOT EXISTS org_repos (
         Ok(out)
     }
 
-    /// Mark every repo as not watched (start of a watch sync pass).
+    /// Mark every repo as not watched (start of a watch sync pass). The
+    /// per-repo subscription state is also cleared so a stale `watched` from a
+    /// previous pass can't survive; `sync_repo_subscriptions` re-establishes it.
     pub fn clear_watched(&self) -> Result<()> {
         let conn = self.conn.lock().expect("db lock poisoned");
-        conn.execute("UPDATE repos SET is_watched = 0", [])
-            .context("clearing watched flags")?;
+        conn.execute(
+            "UPDATE repos SET is_watched = 0, subscription_state = NULL",
+            [],
+        )
+        .context("clearing watched flags")?;
         Ok(())
     }
 
@@ -452,8 +462,11 @@ CREATE TABLE IF NOT EXISTS org_repos (
     pub fn upsert_watched_repo(&self, full_name: &str, html_url: &str) -> Result<()> {
         let id = self.upsert_repo(full_name, Some(html_url))?;
         let conn = self.conn.lock().expect("db lock poisoned");
-        conn.execute("UPDATE repos SET is_watched = 1 WHERE id = ?1", params![id])
-            .context("marking repo watched")?;
+        conn.execute(
+            "UPDATE repos SET is_watched = 1, subscription_state = 'watched' WHERE id = ?1",
+            params![id],
+        )
+        .context("marking repo watched")?;
         Ok(())
     }
 
@@ -613,7 +626,7 @@ CREATE TABLE IF NOT EXISTS org_repos (
     pub fn list_repos(&self, f: &RepoFilter) -> Result<Vec<RepoItem>> {
         let conn = self.conn.lock().expect("db lock poisoned");
         let mut sql = String::from(
-            "SELECT r.full_name, r.html_url, r.is_watched, r.last_refreshed_at
+            "SELECT r.full_name, r.html_url, r.is_watched, r.last_refreshed_at, r.subscription_state
              FROM repos r WHERE (r.is_watched = 1",
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -626,9 +639,11 @@ CREATE TABLE IF NOT EXISTS org_repos (
         }
         sql.push(')');
         if f.show == "watched" {
-            sql.push_str(" AND r.is_watched = 1");
+            sql.push_str(" AND (r.is_watched = 1 OR r.subscription_state = 'watched')");
         } else if f.show == "untracked" {
             sql.push_str(" AND r.is_watched = 0");
+        } else if f.show == "ignored" {
+            sql.push_str(" AND r.subscription_state = 'ignored'");
         }
         if let Some(search) = f.search.filter(|s| !s.is_empty()) {
             sql.push_str(" AND r.full_name LIKE ?");
@@ -648,6 +663,7 @@ CREATE TABLE IF NOT EXISTS org_repos (
                     html_url: row.get(1)?,
                     is_watched: row.get::<_, i64>(2)? != 0,
                     last_refreshed_at: row.get(3)?,
+                    subscription_state: row.get(4)?,
                 })
             })
             .context("querying repos")?;
@@ -750,6 +766,73 @@ CREATE TABLE IF NOT EXISTS org_repos (
         )
         .context("updating repo watched flag")?;
         Ok(())
+    }
+
+    /// Set a repo's cached per-repo subscription state.
+    pub fn set_repo_subscription_state(&self, full_name: &str, state: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.execute(
+            "UPDATE repos SET subscription_state = ?2 WHERE full_name = ?1",
+            params![full_name, state],
+        )
+        .context("setting repo subscription state")?;
+        Ok(())
+    }
+
+    /// Record a repo's per-repo subscription state after a live check (200/404).
+    pub fn set_repo_subscription(
+        &self,
+        full_name: &str,
+        state: &str,
+        etag: Option<&str>,
+        checked_at: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.execute(
+            "UPDATE repos SET subscription_state = ?2, subscription_etag = ?3,
+                    subscription_checked_at = ?4
+             WHERE full_name = ?1",
+            params![full_name, state, etag, checked_at],
+        )
+        .context("recording repo subscription")?;
+        Ok(())
+    }
+
+    /// Record that a repo's subscription was re-verified unchanged (304).
+    pub fn touch_repo_subscription(&self, full_name: &str, checked_at: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.execute(
+            "UPDATE repos SET subscription_checked_at = ?2 WHERE full_name = ?1",
+            params![full_name, checked_at],
+        )
+        .context("touching repo subscription")?;
+        Ok(())
+    }
+
+    /// The stored per-repo subscription ETag, if any.
+    pub fn repo_subscription_etag(&self, full_name: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.query_row(
+            "SELECT subscription_etag FROM repos WHERE full_name = ?1",
+            params![full_name],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(|o| o.flatten())
+        .context("reading repo subscription etag")
+    }
+
+    /// Whether the repo is currently flagged as watched.
+    pub fn is_repo_watched(&self, full_name: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.query_row(
+            "SELECT is_watched FROM repos WHERE full_name = ?1",
+            params![full_name],
+            |row| row.get::<_, i64>(0).map(|v| v != 0),
+        )
+        .optional()
+        .map(|o| o.unwrap_or(false))
+        .context("reading repo watched flag")
     }
 
     /// Run a closure against the guarded connection (used by cross-module
@@ -985,5 +1068,51 @@ mod tests {
         let other = db.list_org_repos("other", "").expect("list");
         assert_eq!(other.len(), 1);
         assert_eq!(other[0].full_name, "o/unrelated");
+    }
+
+    #[test]
+    fn repo_subscription_states_roundtrip_and_filter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("open");
+        for full in ["a/w", "a/i", "a/p"] {
+            db.upsert_repo(full, Some(&format!("https://github.com/{full}")))
+                .expect("repo");
+        }
+        db.set_repo_watched("a/w", true).expect("watched");
+        db.set_repo_subscription_state("a/w", "watched")
+            .expect("state");
+        db.set_repo_subscription_state("a/i", "ignored")
+            .expect("state");
+        db.set_repo_subscription("a/p", "participating", None, "2026-09-06T00:00:00Z")
+            .expect("state");
+        assert_eq!(db.repo_subscription_etag("a/p").expect("etag"), None);
+
+        let filter = |show: &str| {
+            db.list_repos(&RepoFilter {
+                workspace_repos: &["a/w".into(), "a/i".into(), "a/p".into()],
+                show,
+                search: None,
+            })
+            .expect("list")
+            .into_iter()
+            .map(|i| i.full_name)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(filter("all"), vec!["a/i", "a/p", "a/w"]);
+        assert_eq!(filter("watched"), vec!["a/w"]);
+        assert_eq!(filter("untracked"), vec!["a/i", "a/p"]);
+        assert_eq!(filter("ignored"), vec!["a/i"]);
+
+        // 304-style touch keeps the state and only bumps the check time.
+        db.touch_repo_subscription("a/i", "2026-09-06T01:00:00Z")
+            .expect("touch");
+        let state = db
+            .list_repos(&RepoFilter {
+                workspace_repos: &["a/i".into()],
+                show: "all",
+                search: None,
+            })
+            .expect("list");
+        assert_eq!(state[0].subscription_state.as_deref(), Some("ignored"));
     }
 }
