@@ -16,11 +16,19 @@
       <button class="tab" data-view="settings">Settings</button>
     </nav>
     <select id="ws" class="ws-select" title="Workspace" aria-label="Workspace"></select>
-    <button id="add-ws" title="Add workspace" aria-label="Add workspace">+</button>
-    <button id="sync" title="Sync now" aria-label="Sync now">Sync</button>
+    <button id="add-ws" class="icon-btn" title="Add workspace" aria-label="Add workspace">+</button>
   </header>
-  <div id="status" class="status"></div>
+  <div id="status" class="status">
+    <span id="status-text"></span>
+    <span id="sync-status">
+      <button id="sync" class="icon-btn" title="Sync now" aria-label="Sync now">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/><path d="M13.5 1.5v3h-3"/></svg>
+      </button>
+      <span id="sync-spinner" class="spinner" hidden></span>
+    </span>
+  </div>
   <div id="notice" class="notice" hidden></div>
+  <div id="flash" class="flash" hidden></div>
   <main id="view" class="main"></main>
 
   <dialog id="add-ws-dialog">

@@ -11,6 +11,22 @@
     <input type="search" name="q" value="{{ q }}" placeholder="Search repos">
   </form>
 
+  <div class="bulk-bar" hidden>
+    <span class="sel-count"></span>
+    <button class="icon-btn" data-action="watch" title="Watch selected">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M1 8s2.5-4.5 7-4.5S15 8 15 8s-2.5 4.5-7 4.5S1 8 1 8z"/><circle cx="8" cy="8" r="2.5"/></svg>
+    </button>
+    <button class="icon-btn" data-action="unwatch" title="Stop watching selected">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M1 8s2.5-4.5 7-4.5S15 8 15 8s-2.5 4.5-7 4.5S1 8 1 8z"/><path d="M2 2l12 12"/></svg>
+    </button>
+    <button class="icon-btn" data-action="ignore" title="Ignore selected">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6.5c0 2-1 3-1 4.5h13c0-1.5-1-2.5-1-4.5a6.5 6.5 0 0 0-1.5-4.2"/><path d="M6.5 13a1.8 1.8 0 0 0 3 0"/><path d="M1.5 1.5l13 13"/></svg>
+    </button>
+    <button class="icon-btn" data-action="unignore" title="Stop ignoring selected">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6.5c0 2-1 3-1 4.5h13c0-1.5-1-2.5-1-4.5a6.5 6.5 0 0 0-1.5-4.2"/><path d="M6.5 13a1.8 1.8 0 0 0 3 0"/></svg>
+    </button>
+  </div>
+
   <table class="data">
     <thead>
       <tr>
@@ -43,12 +59,4 @@
       {% endfor %}
     </tbody>
   </table>
-
-  <div class="bulk-bar" hidden>
-    <span class="sel-count"></span>
-    <button data-action="watch">Watch</button>
-    <button data-action="unwatch">Unwatch</button>
-    <button data-action="ignore">Ignore</button>
-    <button data-action="unignore">Unignore</button>
-  </div>
 </div>

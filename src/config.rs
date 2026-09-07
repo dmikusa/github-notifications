@@ -36,6 +36,15 @@ pub struct GithubConfig {
     pub poll_interval_seconds: u64,
     #[serde(default = "default_repo_refresh_interval")]
     pub repo_refresh_interval_seconds: u64,
+    #[serde(default = "default_sync_concurrency")]
+    pub sync_concurrency: u64,
+}
+
+impl GithubConfig {
+    /// The sync concurrency clamped to its valid range: at least 1, at most 10.
+    pub fn effective_sync_concurrency(&self) -> usize {
+        self.sync_concurrency.clamp(1, 10) as usize
+    }
 }
 
 impl Default for GithubConfig {
@@ -46,6 +55,7 @@ impl Default for GithubConfig {
             oauth_client_id: String::new(),
             poll_interval_seconds: default_poll_interval(),
             repo_refresh_interval_seconds: default_repo_refresh_interval(),
+            sync_concurrency: default_sync_concurrency(),
         }
     }
 }
@@ -56,6 +66,11 @@ fn default_poll_interval() -> u64 {
 
 fn default_repo_refresh_interval() -> u64 {
     600
+}
+
+/// How many GitHub API requests to make concurrently during a sync pass.
+fn default_sync_concurrency() -> u64 {
+    3
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -204,6 +219,10 @@ poll_interval_seconds = 300
 # How often to refresh open issues and pull requests for each tracked repo,
 # in seconds.
 repo_refresh_interval_seconds = 600
+
+# How many GitHub API requests to make concurrently during a sync pass.
+# Must be between 1 and 10. Defaults to 3.
+sync_concurrency = 3
 
 # Workspaces group repos and saved filters into separate views (e.g. personal
 # vs work). Each workspace has one or more repo sets: explicit lists of repos
@@ -465,6 +484,7 @@ mod tests {
                 oauth_client_id: "client-123".into(),
                 poll_interval_seconds: 60,
                 repo_refresh_interval_seconds: 120,
+                sync_concurrency: 5,
             },
             workspaces: vec![Workspace {
                 name: "personal".into(),
@@ -481,12 +501,29 @@ mod tests {
         assert_eq!(parsed.github.auth_provider, AuthProvider::GhToken);
         assert_eq!(parsed.github.oauth_client_id, "client-123");
         assert_eq!(parsed.github.poll_interval_seconds, 60);
+        assert_eq!(parsed.github.repo_refresh_interval_seconds, 120);
+        assert_eq!(parsed.github.sync_concurrency, 5);
         assert_eq!(parsed.workspaces[0].name, "personal");
         assert!(parsed.workspaces[0].auto_dismiss_closed_merged);
         assert_eq!(
             parsed.workspaces[0].repo_sets[0].repos[0],
             "paketo-buildpacks/abc"
         );
+    }
+
+    #[test]
+    fn sync_concurrency_defaults_and_clamps() {
+        assert_eq!(default_sync_concurrency(), 3);
+        assert_eq!(GithubConfig::default().effective_sync_concurrency(), 3);
+
+        // Clamped to at least 1.
+        let mut cfg = GithubConfig::default();
+        cfg.sync_concurrency = 0;
+        assert_eq!(cfg.effective_sync_concurrency(), 1);
+
+        // Clamped to at most 10.
+        cfg.sync_concurrency = 42;
+        assert_eq!(cfg.effective_sync_concurrency(), 10);
     }
 
     #[test]

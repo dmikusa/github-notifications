@@ -401,6 +401,68 @@ mod tests {
     }
 
     #[test]
+    fn inbox_renders_subject_status_badge() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("db");
+        let repo_id = db
+            .upsert_repo("o/r", Some("https://github.com/o/r"))
+            .expect("repo");
+        let _ = repo_id;
+        let thread = NotificationThread {
+            id: "1:pr".into(),
+            unread: true,
+            reason: "mention".into(),
+            updated_at: "2026-01-03T00:00:00Z".into(),
+            last_read_at: None,
+            subject: ThreadSubject {
+                title: "a merged pr".into(),
+                kind: "PullRequest".into(),
+                url: Some("https://api.github.com/repos/o/r/pulls/7".into()),
+                latest_comment_url: None,
+            },
+            repository: Some(ThreadRepository {
+                full_name: "o/r".into(),
+                html_url: "https://github.com/o/r".into(),
+            }),
+            url: "https://api.github.com/notifications/threads/pr".into(),
+        };
+        db.upsert_thread(&thread).expect("thread");
+        db.set_subject_state(
+            "1:pr",
+            "merged",
+            Some("https://github.com/o/r/pull/7"),
+            Some("\"p1\""),
+            "2026-01-04T00:00:00Z",
+        )
+        .expect("state");
+
+        let ws = Workspace {
+            name: "w".into(),
+            repo_sets: vec![RepoSet {
+                name: "s".into(),
+                repos: vec!["o/r".into()],
+            }],
+            ..Default::default()
+        };
+        let html = render_inbox(
+            &db,
+            &ws,
+            &InboxParams {
+                ws: "w".into(),
+                repo_set: "all".into(),
+                subject_type: "all".into(),
+                reason: "all".into(),
+                unread: false,
+                sort: "updated".into(),
+            },
+        )
+        .expect("render");
+        assert!(html.contains(r#"class="badge status-merged""#));
+        assert!(html.contains(">merged</a>"));
+        assert!(html.contains(r#"href="https://github.com/o/r/pull/7""#));
+    }
+
+    #[test]
     fn queue_filter_controls_are_htmx_wired() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = Database::open(&dir.path().join("data.db")).expect("db");

@@ -113,6 +113,7 @@ async fn main() -> Result<()> {
         validation,
         sync_status: engine.status.clone(),
         sync_trigger: engine.trigger.clone(),
+        current_workspace: engine.current_workspace.clone(),
     });
 
     let listener = tokio::net::TcpListener::bind(addr)

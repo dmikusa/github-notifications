@@ -37,6 +37,8 @@ pub struct AppState {
     pub validation: Arc<Mutex<Option<Validation>>>,
     pub sync_status: Arc<Mutex<SyncStatus>>,
     pub sync_trigger: mpsc::Sender<()>,
+    /// The workspace the UI is currently viewing; the sync engine syncs it.
+    pub current_workspace: Arc<Mutex<String>>,
 }
 
 /// Build the axum router for the local HTTP server.
@@ -53,7 +55,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/views/settings", get(settings_view))
         .route("/api/threads/mark-read", post(threads_mark_read))
         .route("/api/issues/mark-read", post(issues_mark_read))
-        .route("/api/threads/mute", post(thread_mute))
+        .route("/api/threads/mute", post(threads_mute))
         .route("/api/repos/{owner}/{repo}/watch", post(repo_watch))
         .route("/api/repos/{owner}/{repo}/unwatch", post(repo_unwatch))
         .route("/api/repos/{owner}/{repo}/ignore", post(repo_ignore))
@@ -70,6 +72,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/orgs/{org}/repos", get(org_repos))
         .route("/api/workspaces", post(workspace_create))
+        .route("/api/workspaces/{name}/activate", post(workspace_activate))
         .route(
             "/api/notifications/dismiss-closed-merged",
             post(dismiss_closed_merged),
@@ -379,24 +382,34 @@ async fn issues_mark_read(
 }
 
 #[derive(Deserialize)]
-struct MuteBody {
-    id: String,
+struct ThreadsMuteBody {
+    ids: Vec<String>,
 }
 
-async fn thread_mute(State(state): State<AppState>, Json(body): Json<MuteBody>) -> Response {
+/// Unsubscribe (dismiss) one or more notification threads, then drop them from
+/// the local cache so they disappear from the inbox.
+async fn threads_mute(
+    State(state): State<AppState>,
+    Json(body): Json<ThreadsMuteBody>,
+) -> Response {
     let result = async {
-        let Some(api_url) = state.db.thread_api_url(&body.id)? else {
-            return Ok::<(), anyhow::Error>(());
-        };
-        let Some(numeric) = api_url.rsplit('/').next().map(str::to_string) else {
-            return Ok(());
-        };
-        let res = state
-            .github
-            .delete(&format!("/notifications/threads/{numeric}/subscription"))
-            .await?;
-        ensure_success(&res.status, "mute thread")?;
-        Ok(())
+        let mut count = 0usize;
+        for id in &body.ids {
+            let Some(api_url) = state.db.thread_api_url(id)? else {
+                continue;
+            };
+            let Some(numeric) = api_url.rsplit('/').next().map(str::to_string) else {
+                continue;
+            };
+            let res = state
+                .github
+                .delete(&format!("/notifications/threads/{numeric}/subscription"))
+                .await?;
+            ensure_success(&res.status, "dismiss thread")?;
+            count += 1;
+        }
+        state.db.delete_threads(&body.ids)?;
+        Ok::<_, anyhow::Error>(count)
     }
     .await;
     json_response(result)
@@ -705,6 +718,32 @@ async fn workspace_create(
     json_response(result)
 }
 
+/// Switch the app's active workspace. The sync engine only fetches the active
+/// workspace's repos, so switching records the workspace and, if its repos
+/// haven't been refreshed recently, queues a sync for it.
+async fn workspace_activate(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    let result = async {
+        let (exists, refresh_interval) = {
+            let config = state.config.read().expect("config lock poisoned");
+            let ws = config.workspaces.iter().find(|w| w.name == name);
+            (ws.is_some(), config.github.repo_refresh_interval_seconds)
+        };
+        if !exists {
+            anyhow::bail!("no such workspace: {name}");
+        }
+        *state.current_workspace.lock().expect("lock") = name.clone();
+        let last = state
+            .db
+            .get_sync_state(&format!("last_repo_refresh:{name}"))?;
+        if sync::due(&last, refresh_interval) {
+            let _ = state.sync_trigger.try_send(());
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    json_response(result)
+}
+
 async fn dismiss_closed_merged(State(state): State<AppState>) -> Response {
     {
         let mut s = state.sync_status.lock().expect("sync status poisoned");
@@ -834,6 +873,7 @@ mod tests {
             }))),
             sync_status: Arc::new(Mutex::new(SyncStatus::default())),
             sync_trigger,
+            current_workspace: Arc::new(Mutex::new("personal".into())),
         }
     }
 
@@ -960,6 +1000,7 @@ mod tests {
             validation: Arc::new(Mutex::new(None)),
             sync_status: Arc::new(Mutex::new(SyncStatus::default())),
             sync_trigger,
+            current_workspace: Arc::new(Mutex::new("personal".into())),
         }
     }
 
@@ -996,6 +1037,10 @@ mod tests {
             )
             .route(
                 "/repos/o/r/subscription",
+                delete(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/notifications/threads/111/subscription",
                 delete(|| async { StatusCode::NO_CONTENT }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1207,6 +1252,50 @@ mod tests {
         assert_eq!(state, "participating");
     }
 
+    #[tokio::test]
+    async fn threads_mute_dismisses_and_removes_locally() {
+        let (base, _patch_calls) = mock_github_actions().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(Database::open(&dir.path().join("data.db")).expect("db"));
+        let thread = crate::models::NotificationThread {
+            id: "1:111".into(),
+            unread: true,
+            reason: "mention".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            last_read_at: None,
+            subject: crate::models::ThreadSubject {
+                title: "t".into(),
+                kind: "Issue".into(),
+                url: Some("https://api.github.com/repos/o/r/issues/3".into()),
+                latest_comment_url: None,
+            },
+            repository: Some(crate::models::ThreadRepository {
+                full_name: "o/r".into(),
+                html_url: "https://github.com/o/r".into(),
+            }),
+            url: format!("{base}/notifications/threads/111"),
+        };
+        db.upsert_thread(&thread).expect("thread");
+        assert_eq!(db.count("threads").expect("count"), 1);
+
+        let client = github::Client::with_base(Arc::new(ClassicPat::new("ghp_x".into())), &base);
+        let app = router(state_with_client(db.clone(), client));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/threads/mute")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"ids":["1:111"]}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::OK);
+        // The thread was unsubscribed on GitHub and dropped from the cache.
+        assert_eq!(db.count("threads").expect("count"), 0);
+    }
+
     fn state_with_config_file(body: &str) -> (AppState, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let config_path = dir.path().join("config.toml");
@@ -1224,6 +1313,7 @@ mod tests {
             validation: Arc::new(Mutex::new(None)),
             sync_status: Arc::new(Mutex::new(SyncStatus::default())),
             sync_trigger,
+            current_workspace: Arc::new(Mutex::new("personal".into())),
         };
         (state, dir)
     }
@@ -1273,6 +1363,37 @@ mod tests {
             )
             .await
             .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn workspace_activate_sets_current_and_triggers_when_stale() {
+        let (state, _dir) = state_with_config_file(
+            "[github]\nauth_provider = \"gh-token\"\n\n[[workspaces]]\nname = \"personal\"\n",
+        );
+        let app = router(state.clone());
+        let post = |uri: String| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(&uri)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("dispatch")
+            }
+        };
+
+        // Activating a workspace with no repo-refresh record is stale → queues a sync.
+        let response = post("/api/workspaces/personal/activate".to_string()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(*state.current_workspace.lock().expect("lock"), "personal");
+
+        // Activating a nonexistent workspace fails.
+        let response = post("/api/workspaces/nope/activate".to_string()).await;
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 

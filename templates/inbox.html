@@ -41,7 +41,29 @@
       <option value="updated" {% if sort == "updated" %}selected{% endif %}>Updated</option>
       <option value="repo" {% if sort == "repo" %}selected{% endif %}>Repo</option>
     </select>
+    <div class="view-actions">
+      <button type="button" id="dismiss-closed-merged" class="sweep-btn" title="Dismiss notifications for closed or merged PRs">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 4h11"/><path d="M6 2.5h4"/><path d="M3.5 4l.7 9a1 1 0 0 0 1 .9h5.6a1 1 0 0 0 1-.9l.7-9"/></svg>
+        Dismiss all closed/merged
+      </button>
+    </div>
   </form>
+
+  <div class="bulk-bar" hidden>
+    <span class="sel-count"></span>
+    <button class="icon-btn" data-action="mark-read" title="Mark selected as read">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 8.5 5.5 12.5 14.5 3.5"/></svg>
+    </button>
+    <button class="icon-btn" data-action="mark-all-read" title="Mark all as read">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M1 8 4.5 11.5 14 2"/><path d="M6 11.5 7.5 13 16 4.5"/></svg>
+    </button>
+    <button class="icon-btn" data-action="mute" title="Dismiss selected">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6.5c0 2-1 3-1 4.5h13c0-1.5-1-2.5-1-4.5a6.5 6.5 0 0 0-1.5-4.2"/><path d="M6.5 13a1.8 1.8 0 0 0 3 0"/><path d="M1.5 1.5l13 13"/></svg>
+    </button>
+    <button class="icon-btn" data-action="open" title="Open selected in GitHub">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2H3a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-3"/><path d="M9.5 2h4.5v4.5"/><path d="M14 2 8 8"/></svg>
+    </button>
+  </div>
 
   <table class="data">
     <thead>
@@ -50,6 +72,7 @@
         <th>Repo</th>
         <th>Type</th>
         <th>Title</th>
+        <th>Status</th>
         <th>Reason</th>
         <th>Updated</th>
       </tr>
@@ -57,30 +80,28 @@
     <tbody>
       {% for item in items %}
       <tr class="{% if item.unread %}row-unread{% endif %}">
-        <td class="chk"><input type="checkbox" class="sel" value="{{ item.thread_id }}"{% if let Some(url) = item.subject_html_url %} data-html-url="{{ url }}"{% endif %}></td>
+        <td class="chk"><input type="checkbox" class="sel" value="{{ item.thread_id }}"{% if let Some(url) = item.subject_state_html_url %} data-html-url="{{ url }}"{% else if let Some(url) = item.subject_html_url %} data-html-url="{{ url }}"{% endif %}></td>
         <td class="repo">{{ item.repo }}</td>
         <td><span class="badge">{{ item.subject_type }}</span></td>
         <td class="title">
           {% if let Some(url) = item.subject_html_url %}<a href="{{ url }}" target="_blank" rel="noopener">{{ item.subject_title }}</a>
           {% else %}{{ item.subject_title }}{% endif %}
         </td>
+        <td class="status">
+          {% if let Some(state) = item.subject_state.as_deref() %}
+          {% if let Some(url) = item.subject_state_html_url.as_deref() %}
+          <a class="badge status-{{ state }}" href="{{ url }}" target="_blank" rel="noopener">{{ state }}</a>
+          {% else %}
+          <span class="badge status-{{ state }}">{{ state }}</span>
+          {% endif %}
+          {% endif %}
+        </td>
         <td>{{ item.reason }}</td>
         <td class="time">{{ item.updated_at }}</td>
       </tr>
       {% else %}
-      <tr><td colspan="6" class="empty">No notifications match your filters.</td></tr>
+      <tr><td colspan="7" class="empty">No notifications match your filters.</td></tr>
       {% endfor %}
     </tbody>
   </table>
-
-  <div class="bulk-bar" hidden>
-    <span class="sel-count"></span>
-    <button data-action="mark-read">Mark read</button>
-    <button data-action="mark-all-read">Mark all read</button>
-    <button data-action="open">Open in GitHub</button>
-  </div>
-
-  <div class="actions">
-    <button id="dismiss-closed-merged">Dismiss closed/merged</button>
-  </div>
 </div>
