@@ -472,16 +472,16 @@ CREATE TABLE IF NOT EXISTS org_repos (
 
     /// Threads whose subject status (PR state / check run conclusion) should be
     /// refreshed during sync, limited to the given repos (the active
-    /// workspace's repo set). PR threads and check threads with a direct URL
-    /// are re-verified; CheckSuite threads without a URL are resolved once
-    /// from their title (skipped once `subject_state` is set).
+    /// workspace's repo set). PR and Issue threads with a subject URL are
+    /// re-verified; CheckSuite threads without a URL are resolved once from
+    /// their title (skipped once `subject_state` is set).
     pub fn subject_threads_needing_refresh(&self, repos: &[String]) -> Result<Vec<SubjectThread>> {
         let conn = self.conn.lock().expect("db lock poisoned");
         let mut sql = String::from(
             "SELECT t.thread_id, t.subject_type, t.subject_api_url, t.subject_check_url,
                     r.full_name, t.subject_title, t.updated_at
              FROM threads t JOIN repos r ON r.id = t.repo_id
-             WHERE t.subject_type IN ('PullRequest', 'CheckSuite', 'WorkflowRun')
+             WHERE t.subject_type IN ('PullRequest', 'Issue', 'CheckSuite', 'WorkflowRun')
                AND (t.subject_api_url IS NOT NULL
                     OR t.subject_check_url IS NOT NULL
                     OR (t.subject_type = 'CheckSuite' AND t.subject_state IS NULL))",
@@ -1337,7 +1337,8 @@ mod tests {
             .subject_threads_needing_refresh(&["o/r".into()])
             .expect("list");
         let ids: Vec<&str> = needing.iter().map(|t| t.thread_id.as_str()).collect();
-        assert_eq!(ids, vec!["1:pr", "2:ci"]);
+        // PR, check, and Issue threads with a subject URL are all candidates.
+        assert_eq!(ids, vec!["1:pr", "2:ci", "3:issue"]);
 
         // Deleting threads drops them from the cache.
         db.delete_threads(&["1:pr".into(), "2:ci".into()])

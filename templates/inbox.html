@@ -85,6 +85,7 @@
         <td><span class="badge">{{ item.subject_type }}</span></td>
         <td class="title">
           {% if let Some(url) = item.subject_html_url %}<a href="{{ url }}" target="_blank" rel="noopener">{{ item.subject_title }}</a>
+          {% else if let Some(url) = item.subject_state_html_url %}<a href="{{ url }}" target="_blank" rel="noopener">{{ item.subject_title }}</a>
           {% else %}{{ item.subject_title }}{% endif %}
         </td>
         <td class="status">

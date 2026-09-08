@@ -533,14 +533,15 @@ async fn sync_one_subject_state(
     status: &Arc<Mutex<SyncStatus>>,
     thread: crate::db::SubjectThread,
 ) -> Result<()> {
-    let url: Option<String> = if thread.subject_type == "PullRequest" {
-        thread.subject_api_url.clone()
-    } else {
-        thread
-            .subject_check_url
-            .clone()
-            .or(thread.subject_api_url.clone())
-    };
+    let url: Option<String> =
+        if thread.subject_type == "PullRequest" || thread.subject_type == "Issue" {
+            thread.subject_api_url.clone()
+        } else {
+            thread
+                .subject_check_url
+                .clone()
+                .or(thread.subject_api_url.clone())
+        };
     let Some(url) = url else {
         // CheckSuite notifications carry no subject URL, so resolve the
         // workflow run from the title (one-shot; the outcome is final).
@@ -579,6 +580,21 @@ async fn sync_one_subject_state(
                     &thread.thread_id,
                     state,
                     Some(&pr.html_url),
+                    etag.as_deref(),
+                    &checked_at,
+                )?;
+            } else if thread.subject_type == "Issue" {
+                let issue: GithubIssue = serde_json::from_slice(&response.body)
+                    .with_context(|| format!("parsing issue subject for {}", thread.thread_id))?;
+                let state = if issue.state == "closed" {
+                    "closed"
+                } else {
+                    "open"
+                };
+                db.set_subject_state(
+                    &thread.thread_id,
+                    state,
+                    Some(&issue.html_url),
                     etag.as_deref(),
                     &checked_at,
                 )?;
@@ -1423,6 +1439,15 @@ mod tests {
                         r#"{"status":"completed","conclusion":"success","html_url":"https://github.com/o/r/actions/runs/55"}"#,
                     )
                 }),
+            )
+            .route(
+                "/repos/o/r/issues/3",
+                get(|| async {
+                    (
+                        [("ETag", "\"i1\"")],
+                        r#"{"id":3,"number":3,"title":"an issue","state":"open","user":{"login":"a"},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","closed_at":null,"html_url":"https://github.com/o/r/issues/3","url":"https://api.github.com/repos/o/r/issues/3"}"#,
+                    )
+                }),
             );
         tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve");
@@ -1465,6 +1490,13 @@ mod tests {
             Some(format!("{base}/repos/o/r/check-runs/55")),
         ))
         .expect("check thread");
+        db.upsert_thread(&thread(
+            "3:issue",
+            "Issue",
+            Some(format!("{base}/repos/o/r/issues/3")),
+            None,
+        ))
+        .expect("issue thread");
 
         let client = Client::with_base(
             Arc::new(crate::auth::pat::ClassicPat::new("ghp_x".into())),
@@ -1505,6 +1537,8 @@ mod tests {
         assert_eq!(state("1:pr").1, "https://github.com/o/r/pull/7");
         assert_eq!(state("2:ci").0, "success");
         assert_eq!(state("2:ci").1, "https://github.com/o/r/actions/runs/55");
+        assert_eq!(state("3:issue").0, "open");
+        assert_eq!(state("3:issue").1, "https://github.com/o/r/issues/3");
 
         // A second pass re-verifies and keeps the states.
         refresh_subject_states(&client, &db, &status, &config.workspaces[0], &config)
