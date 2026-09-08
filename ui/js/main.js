@@ -3,7 +3,7 @@ window.App = window.App || {};
 
 window.App.status = (() => {
   function set(text, isError) {
-    const el = document.getElementById('status');
+    const el = document.getElementById('status-text');
     if (!el) return;
     el.textContent = text || '';
     el.classList.toggle('error', !!isError);
@@ -38,6 +38,23 @@ window.App.notice = (() => {
     }
   }
   return { update };
+})();
+
+// Transient toast for action feedback ("Marked 3 read", "Dismissed 2", ...).
+window.App.flash = (() => {
+  let timer = null;
+  function show(message, isError) {
+    const el = document.getElementById('flash');
+    if (!el) return;
+    el.textContent = message || '';
+    el.classList.toggle('error', !!isError);
+    el.hidden = false;
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      el.hidden = true;
+    }, 2600);
+  }
+  return { show };
 })();
 
 window.App.views = (() => {
@@ -89,12 +106,24 @@ function showLoading() {
 }
 
 async function onSyncStatus(status) {
+  setSyncRunning(!!status.running);
+  if (status.last_sync) renderSyncText(status.last_sync);
   window.App.notice.update(status);
+  // Load the initial view once the first sync has populated the cache. The
+  // continuous poller (pollTimer) keeps running so background syncs keep the
+  // spinner and "last sync" timestamp fresh.
   if (!viewLoaded && status.populated) {
     viewLoaded = true;
-    clearInterval(pollTimer);
-    pollTimer = null;
     await window.App.views.load(window.App.state.currentView);
+  }
+}
+
+async function syncStatusTick() {
+  try {
+    const st = await window.App.api.getJSON('/api/sync/status');
+    await onSyncStatus(st);
+  } catch (_) {
+    /* daemon unreachable momentarily; try again next tick */
   }
 }
 
@@ -113,6 +142,8 @@ function populateWorkspaces(state) {
   }
 }
 
+let lastAuthText = '';
+
 function renderStatusLine(state) {
   const auth = state.auth;
   let text = `auth: ${auth.provider}`;
@@ -121,9 +152,25 @@ function renderStatusLine(state) {
   } else {
     text += ` (${auth.missing.join(', ') || 'unconfigured'})`;
   }
-  if (state.sync.last_sync) text += ` \u00b7 last sync ${formatLocalTime(state.sync.last_sync)}`;
-  window.App.status.set(text);
+  lastAuthText = text;
+  renderSyncText(state.sync.last_sync);
   window.App.notice.update(state.sync);
+}
+
+function renderSyncText(lastSync) {
+  const text =
+    lastAuthText + (lastSync ? ` \u00b7 last sync ${formatLocalTime(lastSync)}` : '');
+  window.App.status.set(text);
+}
+
+/// Swap the refresh button for a spinner while a sync pass is running, so the
+/// sync can't be triggered again mid-pass.
+function setSyncRunning(running) {
+  const btn = document.getElementById('sync');
+  const spinner = document.getElementById('sync-spinner');
+  if (!btn || !spinner) return;
+  btn.hidden = running;
+  spinner.hidden = !running;
 }
 
 /// Format an RFC3339 timestamp (from the API) in the user's local timezone,
@@ -168,16 +215,21 @@ async function refreshStatusLine() {
       const tab = e.target.closest('.tab');
       if (tab) window.App.views.load(tab.dataset.view);
     });
-    wsSel.addEventListener('change', () => {
+    wsSel.addEventListener('change', async () => {
       window.App.state.currentWorkspace = wsSel.value;
+      // Tell the server which workspace is active; it syncs that workspace's
+      // repos and triggers a refresh if they're stale.
+      await window.App.api.postJSON(
+        `/api/workspaces/${encodeURIComponent(wsSel.value)}/activate`,
+        {}
+      );
       window.App.views.reload();
     });
     document.getElementById('sync').addEventListener('click', async () => {
       const btn = document.getElementById('sync');
-      if (btn.disabled) return;
-      btn.disabled = true;
-      btn.innerHTML =
-        '<span class="spinner" aria-hidden="true"></span>Syncing\u2026';
+      if (!btn || btn.hidden) return;
+      setSyncRunning(true);
+      window.App.flash.show('Syncing\u2026');
       try {
         // A manual sync runs in the background; poll /api/sync/status until
         // `last_sync` advances past the value at click time (or the pass fails).
@@ -198,19 +250,18 @@ async function refreshStatusLine() {
         await window.App.views.reload();
         const state = await refreshStatusLine();
         if (outcome.error) {
-          window.App.status.set(`Sync failed: ${outcome.error}`, true);
+          window.App.flash.show(`Sync failed: ${outcome.error}`, true);
         } else if (!outcome.done) {
-          window.App.status.set('Sync still running \u2014 check back shortly.');
+          window.App.flash.show('Sync still running \u2014 check back shortly.', true);
         } else if (state?.sync?.last_sync) {
-          window.App.status.set(`Sync complete \u00b7 last sync ${formatLocalTime(state.sync.last_sync)}`);
+          window.App.flash.show(`Sync complete \u00b7 last sync ${formatLocalTime(state.sync.last_sync)}`);
         } else {
-          window.App.status.set('Sync complete');
+          window.App.flash.show('Sync complete');
         }
       } catch (err) {
-        window.App.status.set(`Sync failed: ${err.message}`, true);
+        window.App.flash.show(`Sync failed: ${err.message}`, true);
       } finally {
-        btn.disabled = false;
-        btn.textContent = 'Sync';
+        setSyncRunning(false);
       }
     });
 
@@ -224,6 +275,10 @@ async function refreshStatusLine() {
       try {
         await window.App.api.postJSON('/api/workspaces', { name });
         window.App.state.currentWorkspace = name;
+        await window.App.api.postJSON(
+          `/api/workspaces/${encodeURIComponent(name)}/activate`,
+          {}
+        );
         populateWorkspaces(await window.App.api.getState());
         await window.App.views.reload();
       } catch (err) {
@@ -238,12 +293,11 @@ async function refreshStatusLine() {
     document.addEventListener('click', async (e) => {
       if (e.target.id !== 'dismiss-closed-merged') return;
       const btn = e.target;
-      btn.disabled = true;
-      const original = btn.textContent;
-      btn.textContent = 'Dismissing\u2026';
+      if (btn.classList.contains('working')) return;
+      btn.classList.add('working');
+      window.App.flash.show('Dismissing closed/merged notifications\u2026');
       try {
         await window.App.api.postJSON('/api/notifications/dismiss-closed-merged', {});
-        window.App.status.set('Dismissing closed/merged notifications\u2026');
         let count = null;
         for (let i = 0; i < 180; i++) {
           await new Promise((r) => setTimeout(r, 1000));
@@ -253,32 +307,28 @@ async function refreshStatusLine() {
             break;
           }
         }
-        window.App.status.set(
-          count === null ? 'Dismiss still running' : `Dismissed ${count || 0} closed/merged notification(s)`
-        );
         await window.App.views.reload();
+        if (count === null) {
+          window.App.flash.show('Dismiss still running \u2014 check back shortly.', true);
+        } else {
+          window.App.flash.show(`Dismissed ${count || 0} closed/merged notification(s)`);
+        }
       } catch (err) {
-        window.App.status.set(`Dismiss failed: ${err.message}`, true);
+        window.App.flash.show(`Dismiss failed: ${err.message}`, true);
+      } finally {
+        btn.classList.remove('working');
       }
-      btn.disabled = false;
-      btn.textContent = original;
     });
 
     const status = await window.App.api.getJSON('/api/sync/status');
-    if (status.populated) {
-      viewLoaded = true;
-      await window.App.views.load('queue');
-    } else {
+    if (!status.populated) {
       showLoading();
-      pollTimer = setInterval(async () => {
-        try {
-          const s = await window.App.api.getJSON('/api/sync/status');
-          await onSyncStatus(s);
-        } catch (_) {
-          /* daemon unreachable momentarily; try again next tick */
-        }
-      }, 4000);
     }
+    // Continuous sync-status awareness: drives the spinner next to "last sync"
+    // whenever a pass runs, keeps the timestamp fresh, and loads the initial
+    // view once the first sync completes.
+    await syncStatusTick();
+    pollTimer = setInterval(syncStatusTick, 2000);
   } catch (err) {
     window.App.status.set(`Failed to reach the daemon: ${err.message}`, true);
   }

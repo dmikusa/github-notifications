@@ -53,17 +53,20 @@ window.App.table = (() => {
   async function runAction(action) {
     const view = document.querySelector('#view')?.dataset.view;
     const ws = window.App.state.currentWorkspace;
+    let result = null;
     try {
       if (action === 'mark-read') {
         if (view === 'queue') {
-          await window.App.api.postJSON('/api/issues/mark-read', {
+          result = await window.App.api.postJSON('/api/issues/mark-read', {
             ids: selected().map(Number),
           });
         } else if (view === 'inbox') {
-          await window.App.api.postJSON('/api/threads/mark-read', { ids: selected() });
+          result = await window.App.api.postJSON('/api/threads/mark-read', { ids: selected() });
         }
       } else if (action === 'mark-all-read') {
-        await window.App.api.postJSON('/api/threads/mark-read', { all: true, ws });
+        result = await window.App.api.postJSON('/api/threads/mark-read', { all: true, ws });
+      } else if (action === 'mute') {
+        result = await window.App.api.postJSON('/api/threads/mute', { ids: selected() });
       } else if (action === 'open') {
         selectedUrls().forEach((url) => window.open(url, '_blank', 'noopener'));
       } else if (action === 'watch' || action === 'unwatch' || action === 'ignore' || action === 'unignore') {
@@ -71,13 +74,26 @@ window.App.table = (() => {
           const [owner, name] = repo.split('/');
           await window.App.api.postJSON(`/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/${action}`, {});
         }
+        result = selected().length;
       } else {
         return;
       }
     } catch (err) {
-      window.App.status.set(`Action failed: ${err.message}`, true);
+      window.App.flash.show(`Action failed: ${err.message}`, true);
       return;
     }
+    const n = typeof result === 'number' ? result : selected().length;
+    const labels = {
+      'mark-read': 'Marked read',
+      'mark-all-read': 'Marked all read',
+      'mute': 'Dismissed',
+      'open': 'Opened',
+      'watch': 'Watched',
+      'unwatch': 'Unwatched',
+      'ignore': 'Ignored',
+      'unignore': 'Unignored',
+    };
+    window.App.flash.show(`${labels[action]} ${n || ''}`.trim());
     window.App.views.reload();
   }
 

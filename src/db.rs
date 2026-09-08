@@ -43,6 +43,7 @@ pub struct QueueItem {
     pub thread_unread: bool,
     pub thread_reason: Option<String>,
     pub thread_updated: Option<String>,
+    pub merged_at: Option<String>,
 }
 
 /// Filters for the queue query.
@@ -68,6 +69,10 @@ pub struct InboxItem {
     pub updated_at: String,
     pub subject_api_url: Option<String>,
     pub subject_html_url: Option<String>,
+    /// PR open/closed/merged, or a check run conclusion/status.
+    pub subject_state: Option<String>,
+    /// Page for the PR or check run, when the state is known.
+    pub subject_state_html_url: Option<String>,
 }
 
 /// Filters for the inbox query.
@@ -78,6 +83,18 @@ pub struct InboxFilter<'a> {
     pub reason: Option<&'a str>,
     pub unread_only: bool,
     pub sort: &'a str,
+}
+
+/// A thread whose subject status (PR state / check run) may need refreshing.
+#[derive(Debug, Clone)]
+pub struct SubjectThread {
+    pub thread_id: String,
+    pub subject_type: String,
+    pub subject_api_url: Option<String>,
+    pub subject_check_url: Option<String>,
+    pub repo: String,
+    pub subject_title: String,
+    pub updated_at: Option<String>,
 }
 
 /// One row of the repos view.
@@ -104,7 +121,7 @@ pub struct RepoFilter<'a> {
 
 /// Current schema version. Bump whenever the SQLite schema changes; the
 /// database is rebuilt (backed up and recreated) on mismatch.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 impl Database {
     /// Open (creating if needed) the database at `path` and initialize the
@@ -204,11 +221,16 @@ CREATE TABLE IF NOT EXISTS threads (
     subject_title TEXT,
     subject_url   TEXT,
     subject_api_url TEXT,
+    subject_check_url TEXT,
     reason        TEXT,
     unread        INTEGER NOT NULL DEFAULT 1,
     updated_at    TEXT,
     last_read_at  TEXT,
-    api_url       TEXT
+    api_url       TEXT,
+    subject_state TEXT,
+    subject_state_html_url TEXT,
+    subject_state_etag TEXT,
+    subject_state_checked_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS sync_state (
@@ -377,14 +399,16 @@ CREATE TABLE IF NOT EXISTS org_repos (
         conn.execute(
             "INSERT INTO threads
                (thread_id, repo_id, subject_type, subject_title, subject_url,
-                subject_api_url, reason, unread, updated_at, last_read_at, api_url)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                subject_api_url, subject_check_url, reason, unread, updated_at,
+                last_read_at, api_url)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT (thread_id) DO UPDATE SET
                repo_id = excluded.repo_id,
                subject_type = excluded.subject_type,
                subject_title = excluded.subject_title,
                subject_url = excluded.subject_url,
                subject_api_url = excluded.subject_api_url,
+               subject_check_url = excluded.subject_check_url,
                reason = excluded.reason,
                unread = excluded.unread,
                updated_at = excluded.updated_at,
@@ -396,6 +420,7 @@ CREATE TABLE IF NOT EXISTS org_repos (
                 thread.subject.title,
                 thread.subject.url,
                 thread.subject.url,
+                thread.subject.latest_comment_url,
                 thread.reason,
                 thread.unread,
                 thread.updated_at,
@@ -443,6 +468,124 @@ CREATE TABLE IF NOT EXISTS org_repos (
             out.push(row.context("reading unread PR thread row")?);
         }
         Ok(out)
+    }
+
+    /// Threads whose subject status (PR state / check run conclusion) should be
+    /// refreshed during sync, limited to the given repos (the active
+    /// workspace's repo set). PR and Issue threads with a subject URL are
+    /// re-verified; CheckSuite threads without a URL are resolved once from
+    /// their title (skipped once `subject_state` is set).
+    pub fn subject_threads_needing_refresh(&self, repos: &[String]) -> Result<Vec<SubjectThread>> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let mut sql = String::from(
+            "SELECT t.thread_id, t.subject_type, t.subject_api_url, t.subject_check_url,
+                    r.full_name, t.subject_title, t.updated_at
+             FROM threads t JOIN repos r ON r.id = t.repo_id
+             WHERE t.subject_type IN ('PullRequest', 'Issue', 'CheckSuite', 'WorkflowRun')
+               AND (t.subject_api_url IS NOT NULL
+                    OR t.subject_check_url IS NOT NULL
+                    OR (t.subject_type = 'CheckSuite' AND t.subject_state IS NULL))",
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if !repos.is_empty() {
+            let repo_clause = in_clause(repos.len());
+            sql.push_str(&format!(" AND r.full_name IN {repo_clause}"));
+            for repo in repos {
+                params.push(Box::new(repo.clone()));
+            }
+        }
+        let mut stmt = conn
+            .prepare(&sql)
+            .context("preparing subject refresh query")?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok(SubjectThread {
+                    thread_id: row.get(0)?,
+                    subject_type: row.get(1)?,
+                    subject_api_url: row.get(2)?,
+                    subject_check_url: row.get(3)?,
+                    repo: row.get(4)?,
+                    subject_title: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            })
+            .context("querying subject refresh threads")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("reading subject thread")?);
+        }
+        Ok(out)
+    }
+
+    /// Record a refreshed subject status (PR open/closed/merged or check
+    /// conclusion), its page URL, and its ETag.
+    pub fn set_subject_state(
+        &self,
+        thread_id: &str,
+        state: &str,
+        html_url: Option<&str>,
+        etag: Option<&str>,
+        checked_at: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.execute(
+            "UPDATE threads SET subject_state = ?2, subject_state_html_url = ?3,
+                    subject_state_etag = ?4, subject_state_checked_at = ?5
+             WHERE thread_id = ?1",
+            params![thread_id, state, html_url, etag, checked_at],
+        )
+        .context("recording subject state")?;
+        Ok(())
+    }
+
+    /// Record that a subject was re-verified unchanged (304).
+    pub fn touch_subject_state(&self, thread_id: &str, checked_at: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.execute(
+            "UPDATE threads SET subject_state_checked_at = ?2 WHERE thread_id = ?1",
+            params![thread_id, checked_at],
+        )
+        .context("touching subject state")?;
+        Ok(())
+    }
+
+    /// The stored subject-state ETag for a thread, if any.
+    pub fn subject_state_etag(&self, thread_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.query_row(
+            "SELECT subject_state_etag FROM threads WHERE thread_id = ?1",
+            params![thread_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(|o| o.flatten())
+        .context("reading subject state etag")
+    }
+
+    /// The cached subject state for a thread, if known.
+    pub fn thread_subject_state(&self, thread_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.query_row(
+            "SELECT subject_state FROM threads WHERE thread_id = ?1",
+            params![thread_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(|o| o.flatten())
+        .context("reading thread subject state")
+    }
+
+    /// Delete threads locally (e.g. after dismissing/unsubscribing them).
+    pub fn delete_threads(&self, thread_ids: &[String]) -> Result<()> {
+        if thread_ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let in_clause = in_clause(thread_ids.len());
+        let sql = format!("DELETE FROM threads WHERE thread_id IN {in_clause}");
+        conn.execute(&sql, rusqlite::params_from_iter(thread_ids.iter()))
+            .context("deleting threads")?;
+        Ok(())
     }
 
     /// Mark every repo as not watched (start of a watch sync pass). The
@@ -513,7 +656,8 @@ CREATE TABLE IF NOT EXISTS org_repos (
                      ORDER BY t.updated_at DESC LIMIT 1) AS thread_reason,
                     (SELECT t.updated_at FROM threads t
                      WHERE t.repo_id = i.repo_id AND t.subject_api_url = i.api_url
-                     ORDER BY t.updated_at DESC LIMIT 1) AS thread_updated
+                     ORDER BY t.updated_at DESC LIMIT 1) AS thread_updated,
+                    i.merged_at
              FROM issues i JOIN repos r ON r.id = i.repo_id
              WHERE i.state = 'open'",
         );
@@ -562,6 +706,7 @@ CREATE TABLE IF NOT EXISTS org_repos (
                     thread_unread: row.get::<_, i64>(9)? != 0,
                     thread_reason: row.get(10)?,
                     thread_updated: row.get(11)?,
+                    merged_at: row.get(12)?,
                 })
             })
             .context("querying queue")?;
@@ -574,7 +719,8 @@ CREATE TABLE IF NOT EXISTS org_repos (
         let conn = self.conn.lock().expect("db lock poisoned");
         let mut sql = String::from(
             "SELECT t.thread_id, r.full_name, t.subject_type, t.subject_title,
-                    t.reason, t.unread, t.updated_at, t.subject_api_url
+                    t.reason, t.unread, t.updated_at, t.subject_api_url,
+                    t.subject_state, t.subject_state_html_url
              FROM threads t JOIN repos r ON r.id = t.repo_id
              WHERE 1 = 1",
         );
@@ -615,6 +761,11 @@ CREATE TABLE IF NOT EXISTS org_repos (
                     updated_at: row.get(6)?,
                     subject_html_url: subject_html_url(subject_api_url.as_deref()),
                     subject_api_url,
+                    // "unresolved" is a sync sentinel, not something to display.
+                    subject_state: row
+                        .get::<_, Option<String>>(8)?
+                        .filter(|s| s != "unresolved"),
+                    subject_state_html_url: row.get(9)?,
                 })
             })
             .context("querying inbox")?;
@@ -1114,5 +1265,84 @@ mod tests {
             })
             .expect("list");
         assert_eq!(state[0].subscription_state.as_deref(), Some("ignored"));
+    }
+
+    #[test]
+    fn subject_state_roundtrip_and_thread_delete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("open");
+        let thread = |id: &str, kind: &str, api: Option<&str>, check: Option<&str>| {
+            crate::models::NotificationThread {
+                id: id.into(),
+                unread: true,
+                reason: "mention".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+                last_read_at: None,
+                subject: crate::models::ThreadSubject {
+                    title: "t".into(),
+                    kind: kind.into(),
+                    url: api.map(str::to_string),
+                    latest_comment_url: check.map(str::to_string),
+                },
+                repository: Some(crate::models::ThreadRepository {
+                    full_name: "o/r".into(),
+                    html_url: "https://github.com/o/r".into(),
+                }),
+                url: format!("https://api.github.com/notifications/threads/{id}"),
+            }
+        };
+        db.upsert_thread(&thread(
+            "1:pr",
+            "PullRequest",
+            Some("https://api.github.com/repos/o/r/pulls/7"),
+            None,
+        ))
+        .expect("pr");
+        db.upsert_thread(&thread(
+            "2:ci",
+            "CheckSuite",
+            None,
+            Some("https://api.github.com/repos/o/r/check-runs/55"),
+        ))
+        .expect("ci");
+        // A plain issue thread is not a subject-refresh candidate.
+        db.upsert_thread(&thread(
+            "3:issue",
+            "Issue",
+            Some("https://api.github.com/repos/o/r/issues/3"),
+            None,
+        ))
+        .expect("issue");
+
+        db.set_subject_state(
+            "1:pr",
+            "merged",
+            Some("https://github.com/o/r/pull/7"),
+            Some("\"p1\""),
+            "2026-01-02T00:00:00Z",
+        )
+        .expect("state");
+        assert_eq!(
+            db.subject_state_etag("1:pr").expect("etag").as_deref(),
+            Some("\"p1\"")
+        );
+        assert_eq!(
+            db.thread_subject_state("1:pr").expect("state").as_deref(),
+            Some("merged")
+        );
+        db.touch_subject_state("1:pr", "2026-01-03T00:00:00Z")
+            .expect("touch");
+
+        let needing = db
+            .subject_threads_needing_refresh(&["o/r".into()])
+            .expect("list");
+        let ids: Vec<&str> = needing.iter().map(|t| t.thread_id.as_str()).collect();
+        // PR, check, and Issue threads with a subject URL are all candidates.
+        assert_eq!(ids, vec!["1:pr", "2:ci", "3:issue"]);
+
+        // Deleting threads drops them from the cache.
+        db.delete_threads(&["1:pr".into(), "2:ci".into()])
+            .expect("delete");
+        assert_eq!(db.count("threads").expect("count"), 1);
     }
 }

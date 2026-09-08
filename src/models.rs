@@ -55,11 +55,47 @@ pub struct GithubUser {
     pub login: String,
 }
 
-/// PR detail used for the auto-dismiss check (`GET /repos/{o}/{r}/pulls/{n}`).
+/// PR detail used for the auto-dismiss check and inbox subject status
+/// (`GET /repos/{o}/{r}/pulls/{n}`).
 #[derive(Debug, Deserialize)]
 pub struct GithubPullRequest {
+    #[serde(default)]
     pub state: String,
+    #[serde(default)]
     pub merged_at: Option<String>,
+    #[serde(default)]
+    pub html_url: String,
+}
+
+/// A check run or workflow run (`GET .../check-runs/{id}` / `.../actions/runs/{id}`),
+/// used to show CI status on inbox threads.
+#[derive(Debug, Deserialize)]
+pub struct CheckRun {
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub conclusion: Option<String>,
+    #[serde(default)]
+    pub html_url: Option<String>,
+}
+
+/// A page of workflow runs from `GET /repos/{o}/{r}/actions/runs`.
+#[derive(Debug, Deserialize)]
+pub struct ActionsRuns {
+    #[serde(default)]
+    pub workflow_runs: Vec<ActionsRun>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ActionsRun {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub conclusion: Option<String>,
+    #[serde(default)]
+    pub html_url: String,
+    #[serde(default)]
+    pub created_at: String,
 }
 
 /// A repository from `GET /user/subscriptions`.
