@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::Duration;
 
@@ -252,7 +251,17 @@ async fn sync_notifications(
 
         let threads: Vec<NotificationThread> =
             serde_json::from_slice(&response.body).context("parsing notifications response")?;
+        // Dismissed merged-PR threads (subject API URLs) are never re-added.
+        let dismissed = db.dismissed_subjects()?;
         for thread in &threads {
+            if thread
+                .subject
+                .url
+                .as_deref()
+                .is_some_and(|u| dismissed.contains(u))
+            {
+                continue;
+            }
             db.upsert_thread(thread)?;
         }
 
@@ -336,7 +345,7 @@ async fn sync_one_repo(
 
         if response.status == axum::http::StatusCode::NOT_MODIFIED {
             // The open list is unchanged; clean stale rows against the cached set.
-            db.delete_open_issues_not_in(repo_id, &cached_open)?;
+            db.delete_stale_issues_not_in(repo_id, &cached_open)?;
             break;
         }
         if response.status != axum::http::StatusCode::OK {
@@ -378,7 +387,7 @@ async fn sync_one_repo(
     // remember the current open set for 304-time cleanup.
     if fetched_any {
         db.set_issue_open_set(&full_name, &fetched_urls)?;
-        db.delete_open_issues_not_in(repo_id, &fetched_urls)?;
+        db.delete_stale_issues_not_in(repo_id, &fetched_urls)?;
     }
 
     db.set_repo_refreshed(&full_name, &now_utc())?;
@@ -795,79 +804,80 @@ async fn maybe_auto_dismiss(
     let _ = dismiss_closed_merged(client, db, workspace).await?;
     Ok(())
 }
-
-/// Mark read any unread pull-request threads whose PR is closed and merged,
-/// limited to the given workspace's repos. Returns the number dismissed. Used
-/// by the auto-dismiss option and by a manual "dismiss closed/merged" action
-/// in the UI.
+/// Remove every pull-request notification thread whose PR is closed (whether
+/// merged or not), limited to the given workspace's repos. Unread threads
+/// are marked read on GitHub; all such threads are dropped from the local
+/// cache and remembered so the next notification sync doesn't re-add them.
+/// Returns the number dismissed. Used by the auto-dismiss option and by a
+/// manual "dismiss closed/merged" action in the UI.
 pub async fn dismiss_closed_merged(
     client: &Client,
     db: &Database,
     workspace: &Workspace,
 ) -> Result<usize> {
     let mut count = 0;
-    let mut seen = BTreeSet::new();
-    for (thread_id, thread_api_url, subject_api_url) in
-        db.get_unread_pr_threads(&workspace.tracked_repos())?
-    {
-        if !seen.insert(subject_api_url.clone()) {
-            continue;
-        }
-        // The numeric thread id used by the GitHub thread endpoints (the
-        // notification `id` like "1:111" is the local key instead).
-        let Some(numeric_id) = thread_api_url.rsplit('/').next().map(str::to_string) else {
+    let mut dismissed_ids = Vec::new();
+    let mut dismissed_subjects = Vec::new();
+    // Whether each subject PR is closed; dedupes the per-PR fetch across
+    // the (possibly multiple) threads that reference the same PR.
+    let mut closed: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    for thread in db.get_pr_threads(&workspace.tracked_repos())? {
+        let Some(numeric_id) = thread.api_url.rsplit('/').next().map(str::to_string) else {
             continue;
         };
-
-        // Fast path: the inbox subject-state refresh already knows this PR is
-        // merged, so skip the per-thread fetch.
-        if db.thread_subject_state(&thread_id)?.as_deref() == Some("merged") {
+        let subject_closed = match closed.get(&thread.subject_api_url) {
+            Some(m) => *m,
+            None => {
+                let m = match thread.subject_state.as_deref() {
+                    Some("merged") | Some("closed") => true,
+                    _ => {
+                        let etag_key = format!("etag:pr:{}", thread.subject_api_url);
+                        let etag = db.get_sync_state(&etag_key)?;
+                        let response = client
+                            .get_url(&thread.subject_api_url, etag.as_deref())
+                            .await?;
+                        if response.status != axum::http::StatusCode::OK {
+                            false // 304 (unchanged) or deleted subject; skip
+                        } else {
+                            if let Some(etag) =
+                                response.headers.get("etag").and_then(|v| v.to_str().ok())
+                            {
+                                db.set_sync_state(&etag_key, etag)?;
+                            }
+                            match serde_json::from_slice::<GithubPullRequest>(&response.body) {
+                                Ok(pr) => pr.state == "closed",
+                                Err(_) => false,
+                            }
+                        }
+                    }
+                };
+                closed.insert(thread.subject_api_url.clone(), m);
+                m
+            }
+        };
+        if !subject_closed {
+            continue;
+        }
+        if thread.unread {
             let path = format!("/notifications/threads/{numeric_id}");
             let res = client.patch(&path).await?;
-            if matches!(
+            if !matches!(
                 res.status,
                 axum::http::StatusCode::OK
                     | axum::http::StatusCode::NO_CONTENT
                     | axum::http::StatusCode::RESET_CONTENT
             ) {
-                db.set_thread_unread(&thread_id, false)?;
-                count += 1;
-                tracing::info!("dismissed merged PR thread {thread_id}");
-            }
-            continue;
-        }
-
-        let etag_key = format!("etag:pr:{subject_api_url}");
-        let etag = db.get_sync_state(&etag_key)?;
-        let response = client.get_url(&subject_api_url, etag.as_deref()).await?;
-        if response.status == axum::http::StatusCode::NOT_MODIFIED {
-            continue;
-        }
-        if response.status != axum::http::StatusCode::OK {
-            continue; // e.g. deleted subject; skip
-        }
-        if let Some(etag) = response.headers.get("etag").and_then(|v| v.to_str().ok()) {
-            db.set_sync_state(&etag_key, etag)?;
-        }
-
-        let pr: GithubPullRequest = match serde_json::from_slice(&response.body) {
-            Ok(pr) => pr,
-            Err(_) => continue,
-        };
-        if pr.state == "closed" && pr.merged_at.is_some() {
-            let path = format!("/notifications/threads/{numeric_id}");
-            let res = client.patch(&path).await?;
-            if matches!(
-                res.status,
-                axum::http::StatusCode::OK
-                    | axum::http::StatusCode::NO_CONTENT
-                    | axum::http::StatusCode::RESET_CONTENT
-            ) {
-                db.set_thread_unread(&thread_id, false)?;
-                count += 1;
-                tracing::info!("dismissed merged PR thread {thread_id}");
+                continue;
             }
         }
+        count += 1;
+        dismissed_ids.push(thread.thread_id.clone());
+        dismissed_subjects.push(thread.subject_api_url.clone());
+        tracing::info!("dismissed merged PR thread {}", thread.thread_id);
+    }
+    if !dismissed_ids.is_empty() {
+        db.record_dismissed_subjects(&dismissed_subjects)?;
+        db.delete_threads(&dismissed_ids)?;
     }
     Ok(count)
 }
@@ -1078,8 +1088,8 @@ mod tests {
 
         assert!(db.count("repos").expect("count") >= 1);
         assert_eq!(db.count("issues").expect("count"), 2);
-        assert_eq!(db.count("threads").expect("count"), 2);
-        // Auto-dismiss marks the merged PR thread read; the issue thread stays.
+        // Auto-dismiss removes the merged PR thread; the issue thread stays.
+        assert_eq!(db.count("threads").expect("count"), 1);
         assert_eq!(db.unread_thread_count().expect("unread"), 1);
     }
 
@@ -1755,5 +1765,75 @@ mod tests {
             0,
             "the out-of-workspace PR must not be fetched"
         );
+    }
+
+    #[tokio::test]
+    async fn sync_notifications_skips_dismissed_subjects() {
+        use axum::routing::get;
+        use axum::Router;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+
+        let payload = format!(
+            r#"[{{"id":"1:pr","unread":true,"reason":"mention",
+                 "updated_at":"2026-01-01T00:00:00Z","last_read_at":null,
+                 "subject":{{"title":"pr","type":"PullRequest","url":"{base}/repos/o/r/pulls/7","latest_comment_url":null}},
+                 "repository":{{"full_name":"o/r","html_url":"https://github.com/o/r"}},
+                 "url":"{base}/notifications/threads/7"}}]"#
+        );
+        let app = Router::new()
+            .route(
+                "/notifications",
+                get(move || async move { ([("ETag", "\"n1\"")], payload.clone()) }),
+            )
+            .route("/user/subscriptions", get(|| async { r#"[]"# }))
+            .route(
+                "/repos/o/r/issues",
+                get(|| async { ([("ETag", "\"i1\"")], r#"[]"#) }),
+            )
+            .route(
+                "/repos/o/r/subscription",
+                get(|| async { axum::http::StatusCode::NOT_FOUND }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("db");
+        // The subject was dismissed; the notification sync must not re-add it.
+        db.record_dismissed_subjects(&[format!("{base}/repos/o/r/pulls/7")])
+            .expect("record");
+
+        let config = Config {
+            github: crate::config::GithubConfig {
+                auth_provider: crate::config::AuthProvider::Pat,
+                auth_token: "ghp_x".into(),
+                poll_interval_seconds: 60,
+                repo_refresh_interval_seconds: 60,
+                ..Default::default()
+            },
+            workspaces: vec![crate::config::Workspace {
+                name: "test".into(),
+                auto_dismiss_closed_merged: false,
+                repo_sets: vec![crate::config::RepoSet {
+                    name: "set".into(),
+                    repos: vec!["o/r".into()],
+                }],
+            }],
+        };
+        let client = Client::with_base(
+            Arc::new(crate::auth::pat::ClassicPat::new("ghp_x".into())),
+            &base,
+        );
+        let status = Arc::new(Mutex::new(SyncStatus::default()));
+
+        sync_once(&client, &db, &config, &status, &config.workspaces[0], true)
+            .await
+            .expect("sync");
+        assert_eq!(db.count("threads").expect("threads"), 0);
     }
 }

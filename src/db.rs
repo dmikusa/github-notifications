@@ -97,6 +97,16 @@ pub struct SubjectThread {
     pub updated_at: Option<String>,
 }
 
+/// A pull-request notification thread (used by the dismiss pass).
+#[derive(Debug, Clone)]
+pub struct PrThread {
+    pub thread_id: String,
+    pub api_url: String,
+    pub subject_api_url: String,
+    pub unread: bool,
+    pub subject_state: Option<String>,
+}
+
 /// One row of the repos view.
 #[derive(Debug, Clone)]
 pub struct RepoItem {
@@ -388,15 +398,16 @@ CREATE TABLE IF NOT EXISTS org_repos (
         Ok(())
     }
 
-    /// Delete cached open issues for a repo that are no longer in the open set
-    /// fetched from GitHub (i.e. they were closed or merged in the meantime).
-    /// An empty `api_urls` means no open issues remain, so every cached open
-    /// row for the repo is stale and is removed.
-    pub fn delete_open_issues_not_in(&self, repo_id: i64, api_urls: &[String]) -> Result<()> {
+    /// Delete cached issues for a repo that are no longer in the open set fetched
+    /// from GitHub (i.e. they were closed or merged in the meantime). Only
+    /// open issues are ever stored, so any row missing from the fetched set is
+    /// stale. An empty `api_urls` means no open issues remain, so every cached
+    /// row for the repo is removed.
+    pub fn delete_stale_issues_not_in(&self, repo_id: i64, api_urls: &[String]) -> Result<()> {
         let conn = self.conn.lock().expect("db lock poisoned");
         let (sql, params) = if api_urls.is_empty() {
             (
-                "DELETE FROM issues WHERE repo_id = ?1 AND state = 'open'".to_string(),
+                "DELETE FROM issues WHERE repo_id = ?1".to_string(),
                 vec![Box::new(repo_id) as Box<dyn rusqlite::ToSql>],
             )
         } else {
@@ -405,8 +416,7 @@ CREATE TABLE IF NOT EXISTS org_repos (
                 .map(|i| format!("?{}", i + 1))
                 .collect();
             let sql = format!(
-                "DELETE FROM issues WHERE repo_id = ?1 AND state = 'open'
-                 AND api_url NOT IN ({})",
+                "DELETE FROM issues WHERE repo_id = ?1 AND api_url NOT IN ({})",
                 placeholders.join(",")
             );
             let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(repo_id)];
@@ -416,7 +426,7 @@ CREATE TABLE IF NOT EXISTS org_repos (
             (sql, params)
         };
         conn.execute(&sql, rusqlite::params_from_iter(params.iter()))
-            .context("deleting stale open issues")?;
+            .context("deleting stale issues")?;
         Ok(())
     }
 
@@ -490,15 +500,16 @@ CREATE TABLE IF NOT EXISTS org_repos (
         Ok(())
     }
 
-    /// Notification id, thread API url, and subject API url for unread
-    /// pull-request threads in the given repos, used by the dismiss pass.
-    pub fn get_unread_pr_threads(&self, repos: &[String]) -> Result<Vec<(String, String, String)>> {
+    /// Notification id, thread API url, subject API url, unread flag, and cached
+    /// subject state for pull-request threads in the given repos, used by the
+    /// "dismiss closed/merged" pass.
+    pub fn get_pr_threads(&self, repos: &[String]) -> Result<Vec<PrThread>> {
         let conn = self.conn.lock().expect("db lock poisoned");
         let mut sql = String::from(
-            "SELECT t.thread_id, t.api_url, t.subject_api_url FROM threads t
-             JOIN repos r ON r.id = t.repo_id
-             WHERE t.unread = 1 AND t.subject_type = 'PullRequest'
-               AND t.api_url IS NOT NULL AND t.subject_api_url IS NOT NULL",
+            "SELECT t.thread_id, t.api_url, t.subject_api_url, t.unread, t.subject_state
+         FROM threads t JOIN repos r ON r.id = t.repo_id
+         WHERE t.subject_type = 'PullRequest'
+           AND t.api_url IS NOT NULL AND t.subject_api_url IS NOT NULL",
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if !repos.is_empty() {
@@ -508,21 +519,47 @@ CREATE TABLE IF NOT EXISTS org_repos (
                 params.push(Box::new(repo.clone()));
             }
         }
-        let mut stmt = conn.prepare(&sql).context("preparing unread PR threads")?;
+        let mut stmt = conn.prepare(&sql).context("preparing PR threads")?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
+                Ok(PrThread {
+                    thread_id: row.get(0)?,
+                    api_url: row.get(1)?,
+                    subject_api_url: row.get(2)?,
+                    unread: row.get::<_, i64>(3)? != 0,
+                    subject_state: row.get(4)?,
+                })
             })
-            .context("querying unread PR threads")?;
+            .context("querying PR threads")?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row.context("reading unread PR thread row")?);
+            out.push(row.context("reading PR thread row")?);
         }
         Ok(out)
+    }
+
+    /// Subject API URLs of dismissed merged-PR threads, so the notification sync
+    /// doesn't re-add them.
+    pub fn dismissed_subjects(&self) -> Result<std::collections::HashSet<String>> {
+        match self.get_sync_state("dismissed_subjects")? {
+            Some(json) => Ok(serde_json::from_str(&json).unwrap_or_default()),
+            None => Ok(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Add subject API URLs to the dismissed set.
+    pub fn record_dismissed_subjects(&self, subjects: &[String]) -> Result<()> {
+        if subjects.is_empty() {
+            return Ok(());
+        }
+        let mut set = self.dismissed_subjects()?;
+        for s in subjects {
+            set.insert(s.clone());
+        }
+        let mut list: Vec<String> = set.into_iter().collect();
+        list.sort();
+        let json = serde_json::to_string(&list)?;
+        self.set_sync_state("dismissed_subjects", &json)
     }
 
     /// Threads whose subject status (PR state / check run conclusion) should be
@@ -1439,7 +1476,7 @@ mod tests {
 
         // A repo with no open issues: an empty fetched set means every cached
         // open row is stale and must be removed.
-        db.delete_open_issues_not_in(repo_id, &[]).expect("delete");
+        db.delete_stale_issues_not_in(repo_id, &[]).expect("delete");
         assert_eq!(db.count("issues").expect("count"), 0);
     }
 }
