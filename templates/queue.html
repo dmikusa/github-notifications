@@ -32,50 +32,34 @@
     </select>
   </form>
 
-  <div class="bulk-bar">
-    <span class="sel-count"></span>
-    <button class="icon-btn" data-action="mark-read" title="Mark selected as read">
-      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 8.5 5.5 12.5 14.5 3.5"/></svg>
-    </button>
-    <button class="icon-btn" data-action="mark-all-read" title="Mark all as read">
-      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M1 8 4.5 11.5 14 2"/><path d="M6 11.5 7.5 13 16 4.5"/></svg>
-    </button>
-    <button class="icon-btn" data-action="open" title="Open selected in GitHub">
-      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2H3a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-3"/><path d="M9.5 2h4.5v4.5"/><path d="M14 2 8 8"/></svg>
-    </button>
-  </div>
-
   <table class="data">
     <thead>
       <tr>
-        <th class="chk"><input type="checkbox" class="sel-all"></th>
         <th>Repo</th>
         <th>#</th>
         <th>Title</th>
+        <th>Author</th>
         <th>Type</th>
         <th>Status</th>
         <th>Updated</th>
-        <th>Thread</th>
       </tr>
     </thead>
     <tbody>
       {% for item in items %}
       <tr class="{% if item.thread_unread %}row-unread{% endif %}">
-        <td class="chk"><input type="checkbox" class="sel" value="{{ item.id }}"
-             data-repo="{{ item.repo }}" data-html-url="{{ item.html_url }}"></td>
         <td class="repo">{{ item.repo }}</td>
         <td class="num">#{{ item.number }}</td>
         <td class="title"><a href="{{ item.html_url }}" target="_blank" rel="noopener">{{ item.title }}</a></td>
+        <td class="author">{% if let Some(author) = item.author.as_deref() %}{{ author }}{% endif %}</td>
         <td class="kind">{{ item.kind }}</td>
         <td class="status">
           {% if item.kind == "pr" && item.merged_at.is_some() %}<span class="badge status-merged">merged</span>
           {% else %}<span class="badge status-{{ item.state }}">{{ item.state }}</span>{% endif %}
         </td>
         <td class="time">{{ item.updated_at }}</td>
-        <td>{% if item.thread_unread %}<span class="badge unread">{% if let Some(reason) = item.thread_reason %}{{ reason }}{% else %}unread{% endif %}</span>{% endif %}</td>
       </tr>
       {% else %}
-      <tr><td colspan="8" class="empty">No items match your filters.</td></tr>
+      <tr><td colspan="7" class="empty">No items match your filters.</td></tr>
       {% endfor %}
     </tbody>
   </table>

@@ -70,8 +70,10 @@
       <tr>
         <th class="chk"><input type="checkbox" class="sel-all"></th>
         <th>Repo</th>
-        <th>Type</th>
+        <th>#</th>
         <th>Title</th>
+        <th>Author</th>
+        <th>Type</th>
         <th>Status</th>
         <th>Reason</th>
         <th>Updated</th>
@@ -82,12 +84,14 @@
       <tr class="{% if item.unread %}row-unread{% endif %}">
         <td class="chk"><input type="checkbox" class="sel" value="{{ item.thread_id }}"{% if let Some(url) = item.subject_state_html_url %} data-html-url="{{ url }}"{% else if let Some(url) = item.subject_html_url %} data-html-url="{{ url }}"{% endif %}></td>
         <td class="repo">{{ item.repo }}</td>
-        <td><span class="badge">{{ item.subject_type }}</span></td>
+        <td class="num">{% if let Some(n) = item.subject_number.as_deref() %}#{{ n }}{% endif %}</td>
         <td class="title">
           {% if let Some(url) = item.subject_html_url %}<a href="{{ url }}" target="_blank" rel="noopener">{{ item.subject_title }}</a>
           {% else if let Some(url) = item.subject_state_html_url %}<a href="{{ url }}" target="_blank" rel="noopener">{{ item.subject_title }}</a>
           {% else %}{{ item.subject_title }}{% endif %}
         </td>
+        <td class="author">{% if let Some(author) = item.subject_author.as_deref() %}{{ author }}{% endif %}</td>
+        <td><span class="badge">{{ item.subject_type }}</span></td>
         <td class="status">
           {% if let Some(state) = item.subject_state.as_deref() %}
           {% if let Some(url) = item.subject_state_html_url.as_deref() %}
@@ -101,7 +105,7 @@
         <td class="time">{{ item.updated_at }}</td>
       </tr>
       {% else %}
-      <tr><td colspan="7" class="empty">No notifications match your filters.</td></tr>
+      <tr><td colspan="9" class="empty">No notifications match your filters.</td></tr>
       {% endfor %}
     </tbody>
   </table>

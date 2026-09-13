@@ -612,6 +612,10 @@ async fn sync_one_subject_state(
                     etag.as_deref(),
                     &checked_at,
                 )?;
+                db.set_subject_author(
+                    &thread.thread_id,
+                    pr.user.as_ref().map(|u| u.login.as_str()),
+                )?;
             } else if thread.subject_type == "Issue" {
                 let issue: GithubIssue = serde_json::from_slice(&response.body)
                     .with_context(|| format!("parsing issue subject for {}", thread.thread_id))?;
@@ -626,6 +630,10 @@ async fn sync_one_subject_state(
                     Some(&issue.html_url),
                     etag.as_deref(),
                     &checked_at,
+                )?;
+                db.set_subject_author(
+                    &thread.thread_id,
+                    issue.user.as_ref().map(|u| u.login.as_str()),
                 )?;
             } else {
                 let run: CheckRun = serde_json::from_slice(&response.body)

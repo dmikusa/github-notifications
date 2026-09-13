@@ -65,6 +65,8 @@ pub struct GithubPullRequest {
     pub merged_at: Option<String>,
     #[serde(default)]
     pub html_url: String,
+    #[serde(default)]
+    pub user: Option<GithubUser>,
 }
 
 /// A check run or workflow run (`GET .../check-runs/{id}` / `.../actions/runs/{id}`),

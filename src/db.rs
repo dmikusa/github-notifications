@@ -44,6 +44,8 @@ pub struct QueueItem {
     pub thread_reason: Option<String>,
     pub thread_updated: Option<String>,
     pub merged_at: Option<String>,
+    /// Issue/PR author login, when known.
+    pub author: Option<String>,
 }
 
 /// Filters for the queue query.
@@ -73,6 +75,10 @@ pub struct InboxItem {
     pub subject_state: Option<String>,
     /// Page for the PR or check run, when the state is known.
     pub subject_state_html_url: Option<String>,
+    /// The PR/issue number, when the thread's subject is one.
+    pub subject_number: Option<String>,
+    /// The PR/issue author, when known.
+    pub subject_author: Option<String>,
 }
 
 /// Filters for the inbox query.
@@ -131,7 +137,7 @@ pub struct RepoFilter<'a> {
 
 /// Current schema version. Bump whenever the SQLite schema changes; the
 /// database is rebuilt (backed up and recreated) on mismatch.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 impl Database {
     /// Open (creating if needed) the database at `path` and initialize the
@@ -240,7 +246,8 @@ CREATE TABLE IF NOT EXISTS threads (
     subject_state TEXT,
     subject_state_html_url TEXT,
     subject_state_etag TEXT,
-    subject_state_checked_at TEXT
+    subject_state_checked_at TEXT,
+    subject_author TEXT
 );
 
 CREATE TABLE IF NOT EXISTS sync_state (
@@ -667,6 +674,17 @@ CREATE TABLE IF NOT EXISTS org_repos (
         .context("reading thread subject state")
     }
 
+    /// Record the subject author (PR/issue login) for a thread.
+    pub fn set_subject_author(&self, thread_id: &str, author: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.execute(
+            "UPDATE threads SET subject_author = ?2 WHERE thread_id = ?1",
+            params![thread_id, author],
+        )
+        .context("recording subject author")?;
+        Ok(())
+    }
+
     /// Delete threads locally (e.g. after dismissing/unsubscribing them).
     pub fn delete_threads(&self, thread_ids: &[String]) -> Result<()> {
         if thread_ids.is_empty() {
@@ -749,7 +767,7 @@ CREATE TABLE IF NOT EXISTS org_repos (
                     (SELECT t.updated_at FROM threads t
                      WHERE t.repo_id = i.repo_id AND t.subject_api_url = i.api_url
                      ORDER BY t.updated_at DESC LIMIT 1) AS thread_updated,
-                    i.merged_at
+                    i.merged_at, i.author
              FROM issues i JOIN repos r ON r.id = i.repo_id
              WHERE i.state = 'open'",
         );
@@ -799,6 +817,7 @@ CREATE TABLE IF NOT EXISTS org_repos (
                     thread_reason: row.get(10)?,
                     thread_updated: row.get(11)?,
                     merged_at: row.get(12)?,
+                    author: row.get(13)?,
                 })
             })
             .context("querying queue")?;
@@ -812,7 +831,7 @@ CREATE TABLE IF NOT EXISTS org_repos (
         let mut sql = String::from(
             "SELECT t.thread_id, r.full_name, t.subject_type, t.subject_title,
                     t.reason, t.unread, t.updated_at, t.subject_api_url,
-                    t.subject_state, t.subject_state_html_url
+                    t.subject_state, t.subject_state_html_url, t.subject_author
              FROM threads t JOIN repos r ON r.id = t.repo_id
              WHERE 1 = 1",
         );
@@ -843,6 +862,7 @@ CREATE TABLE IF NOT EXISTS org_repos (
         let rows = stmt
             .query_map(rusqlite::params_from_iter(params.iter()), |row| {
                 let subject_api_url: Option<String> = row.get(7)?;
+                let subject_number = subject_number(subject_api_url.as_deref());
                 Ok(InboxItem {
                     thread_id: row.get(0)?,
                     repo: row.get(1)?,
@@ -858,6 +878,8 @@ CREATE TABLE IF NOT EXISTS org_repos (
                         .get::<_, Option<String>>(8)?
                         .filter(|s| s != "unresolved"),
                     subject_state_html_url: row.get(9)?,
+                    subject_number,
+                    subject_author: row.get(10)?,
                 })
             })
             .context("querying inbox")?;
@@ -1146,6 +1168,12 @@ fn subject_html_url(api: Option<&str>) -> Option<String> {
         other => other,
     };
     Some(format!("https://github.com/{owner}/{repo}/{kind}/{id}"))
+}
+
+/// The numeric PR/issue number from a subject API url, if it is one.
+fn subject_number(api: Option<&str>) -> Option<String> {
+    let id = api?.rsplit('/').next()?;
+    id.parse::<i64>().ok().map(|_| id.to_string())
 }
 
 #[cfg(test)]
