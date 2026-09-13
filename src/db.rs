@@ -97,6 +97,16 @@ pub struct SubjectThread {
     pub updated_at: Option<String>,
 }
 
+/// A pull-request notification thread (used by the dismiss pass).
+#[derive(Debug, Clone)]
+pub struct PrThread {
+    pub thread_id: String,
+    pub api_url: String,
+    pub subject_api_url: String,
+    pub unread: bool,
+    pub subject_state: Option<String>,
+}
+
 /// One row of the repos view.
 #[derive(Debug, Clone)]
 pub struct RepoItem {
@@ -388,6 +398,53 @@ CREATE TABLE IF NOT EXISTS org_repos (
         Ok(())
     }
 
+    /// Delete cached issues for a repo that are no longer in the open set fetched
+    /// from GitHub (i.e. they were closed or merged in the meantime). Only
+    /// open issues are ever stored, so any row missing from the fetched set is
+    /// stale. An empty `api_urls` means no open issues remain, so every cached
+    /// row for the repo is removed.
+    pub fn delete_stale_issues_not_in(&self, repo_id: i64, api_urls: &[String]) -> Result<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let (sql, params) = if api_urls.is_empty() {
+            (
+                "DELETE FROM issues WHERE repo_id = ?1".to_string(),
+                vec![Box::new(repo_id) as Box<dyn rusqlite::ToSql>],
+            )
+        } else {
+            // Placeholders start at ?2 (repo_id is ?1).
+            let placeholders: Vec<String> = (1..=api_urls.len())
+                .map(|i| format!("?{}", i + 1))
+                .collect();
+            let sql = format!(
+                "DELETE FROM issues WHERE repo_id = ?1 AND api_url NOT IN ({})",
+                placeholders.join(",")
+            );
+            let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(repo_id)];
+            for url in api_urls {
+                params.push(Box::new(url.clone()));
+            }
+            (sql, params)
+        };
+        conn.execute(&sql, rusqlite::params_from_iter(params.iter()))
+            .context("deleting stale issues")?;
+        Ok(())
+    }
+
+    /// Store the open-issue API URLs for a repo, so stale cached rows can be
+    /// cleaned even on a 304 (unchanged) response.
+    pub fn set_issue_open_set(&self, full_name: &str, urls: &[String]) -> Result<()> {
+        let json = serde_json::to_string(urls)?;
+        self.set_sync_state(&format!("issues_open:{full_name}"), &json)
+    }
+
+    /// The last fetched open-issue API URLs for a repo, if any.
+    pub fn issue_open_set(&self, full_name: &str) -> Result<Vec<String>> {
+        match self.get_sync_state(&format!("issues_open:{full_name}"))? {
+            Some(json) => Ok(serde_json::from_str(&json).unwrap_or_default()),
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// Upsert a notification thread, resolving (and creating if needed) its
     /// repository row. Threads without a repository are skipped.
     pub fn upsert_thread(&self, thread: &crate::models::NotificationThread) -> Result<()> {
@@ -443,31 +500,66 @@ CREATE TABLE IF NOT EXISTS org_repos (
         Ok(())
     }
 
-    /// Notification id, thread API url, and subject API url for unread
-    /// pull-request threads, used by the auto-dismiss pass.
-    pub fn get_unread_pr_threads(&self) -> Result<Vec<(String, String, String)>> {
+    /// Notification id, thread API url, subject API url, unread flag, and cached
+    /// subject state for pull-request threads in the given repos, used by the
+    /// "dismiss closed/merged" pass.
+    pub fn get_pr_threads(&self, repos: &[String]) -> Result<Vec<PrThread>> {
         let conn = self.conn.lock().expect("db lock poisoned");
-        let mut stmt = conn
-            .prepare(
-                "SELECT thread_id, api_url, subject_api_url FROM threads
-                 WHERE unread = 1 AND subject_type = 'PullRequest'
-                   AND api_url IS NOT NULL AND subject_api_url IS NOT NULL",
-            )
-            .context("preparing unread PR threads")?;
+        let mut sql = String::from(
+            "SELECT t.thread_id, t.api_url, t.subject_api_url, t.unread, t.subject_state
+         FROM threads t JOIN repos r ON r.id = t.repo_id
+         WHERE t.subject_type = 'PullRequest'
+           AND t.api_url IS NOT NULL AND t.subject_api_url IS NOT NULL",
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if !repos.is_empty() {
+            let repo_clause = in_clause(repos.len());
+            sql.push_str(&format!(" AND r.full_name IN {repo_clause}"));
+            for repo in repos {
+                params.push(Box::new(repo.clone()));
+            }
+        }
+        let mut stmt = conn.prepare(&sql).context("preparing PR threads")?;
         let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok(PrThread {
+                    thread_id: row.get(0)?,
+                    api_url: row.get(1)?,
+                    subject_api_url: row.get(2)?,
+                    unread: row.get::<_, i64>(3)? != 0,
+                    subject_state: row.get(4)?,
+                })
             })
-            .context("querying unread PR threads")?;
+            .context("querying PR threads")?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row.context("reading unread PR thread row")?);
+            out.push(row.context("reading PR thread row")?);
         }
         Ok(out)
+    }
+
+    /// Subject API URLs of dismissed merged-PR threads, so the notification sync
+    /// doesn't re-add them.
+    pub fn dismissed_subjects(&self) -> Result<std::collections::HashSet<String>> {
+        match self.get_sync_state("dismissed_subjects")? {
+            Some(json) => Ok(serde_json::from_str(&json).unwrap_or_default()),
+            None => Ok(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Add subject API URLs to the dismissed set.
+    pub fn record_dismissed_subjects(&self, subjects: &[String]) -> Result<()> {
+        if subjects.is_empty() {
+            return Ok(());
+        }
+        let mut set = self.dismissed_subjects()?;
+        for s in subjects {
+            set.insert(s.clone());
+        }
+        let mut list: Vec<String> = set.into_iter().collect();
+        list.sort();
+        let json = serde_json::to_string(&list)?;
+        self.set_sync_state("dismissed_subjects", &json)
     }
 
     /// Threads whose subject status (PR state / check run conclusion) should be
@@ -1344,5 +1436,47 @@ mod tests {
         db.delete_threads(&["1:pr".into(), "2:ci".into()])
             .expect("delete");
         assert_eq!(db.count("threads").expect("count"), 1);
+    }
+
+    #[test]
+    fn delete_open_issues_handles_empty_open_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("open");
+        let repo_id = db
+            .upsert_repo("o/r", Some("https://github.com/o/r"))
+            .expect("repo");
+        let issue = |n: u64, url: &str| crate::models::GithubIssue {
+            id: n,
+            number: n,
+            title: "t".into(),
+            state: "open".into(),
+            user: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            closed_at: None,
+            html_url: format!("https://github.com/o/r/issues/{n}"),
+            url: url.into(),
+            pull_request: None,
+        };
+        db.upsert_issue(
+            repo_id,
+            &issue(1, "https://api.github.com/repos/o/r/issues/1"),
+            "issue",
+            None,
+        )
+        .expect("issue");
+        db.upsert_issue(
+            repo_id,
+            &issue(2, "https://api.github.com/repos/o/r/issues/2"),
+            "pr",
+            None,
+        )
+        .expect("pr");
+        assert_eq!(db.count("issues").expect("count"), 2);
+
+        // A repo with no open issues: an empty fetched set means every cached
+        // open row is stale and must be removed.
+        db.delete_stale_issues_not_in(repo_id, &[]).expect("delete");
+        assert_eq!(db.count("issues").expect("count"), 0);
     }
 }
