@@ -202,7 +202,7 @@ async fn sync_once(
         db.set_sync_state(&repo_refresh_key, &now)?;
     }
 
-    maybe_auto_dismiss(client, db, config).await?;
+    maybe_auto_dismiss(client, db, config, workspace).await?;
 
     db.set_sync_state("last_sync", &now)?;
     Ok(now)
@@ -304,9 +304,16 @@ async fn sync_one_repo(
     let etag_key = format!("etag:issues:{full_name}");
     let etag = db.get_sync_state(&etag_key)?;
     let path = format!("/repos/{owner}/{name}/issues");
+    let repo_id = db.upsert_repo(&full_name, Some(&format!("https://github.com/{full_name}")))?;
+    // The cached open set lets us clean stale rows even on a 304. Until we
+    // have one, fetch unconditionally so existing stale rows get cleaned.
+    let cached_open = db.issue_open_set(&full_name)?;
+    let use_conditional = !cached_open.is_empty();
 
     let mut page_url: Option<String> = None;
     let mut first = true;
+    let mut fetched_urls: Vec<String> = Vec::new();
+    let mut fetched_any = false;
     loop {
         let response = match &page_url {
             Some(url) => client.get_url(url, None).await?,
@@ -315,7 +322,11 @@ async fn sync_one_repo(
                     .get(
                         &path,
                         &[("state", "open"), ("per_page", "100")],
-                        if first { etag.as_deref() } else { None },
+                        if first && use_conditional {
+                            etag.as_deref()
+                        } else {
+                            None
+                        },
                     )
                     .await?
             }
@@ -324,6 +335,8 @@ async fn sync_one_repo(
         record_rate_limit(status, &response.headers);
 
         if response.status == axum::http::StatusCode::NOT_MODIFIED {
+            // The open list is unchanged; clean stale rows against the cached set.
+            db.delete_open_issues_not_in(repo_id, &cached_open)?;
             break;
         }
         if response.status != axum::http::StatusCode::OK {
@@ -336,17 +349,16 @@ async fn sync_one_repo(
             break;
         }
 
+        fetched_any = true;
         let issues: Vec<GithubIssue> = serde_json::from_slice(&response.body)
             .with_context(|| format!("parsing issues for {full_name}"))?;
-
-        let repo_id =
-            db.upsert_repo(&full_name, Some(&format!("https://github.com/{full_name}")))?;
         for issue in issues {
             let kind = if issue.pull_request.is_some() {
                 "pr"
             } else {
                 "issue"
             };
+            fetched_urls.push(issue.url.clone());
             db.upsert_issue(repo_id, &issue, kind, None)?;
         }
 
@@ -359,6 +371,14 @@ async fn sync_one_repo(
         if page_url.is_none() {
             break;
         }
+    }
+
+    // Drop cached open issues that are no longer open on GitHub (closed or
+    // merged since the last fetch) so the queue never shows stale items, and
+    // remember the current open set for 304-time cleanup.
+    if fetched_any {
+        db.set_issue_open_set(&full_name, &fetched_urls)?;
+        db.delete_open_issues_not_in(repo_id, &fetched_urls)?;
     }
 
     db.set_repo_refreshed(&full_name, &now_utc())?;
@@ -759,7 +779,12 @@ async fn resolve_workflow_run(
     best.map(|(url, _)| url)
 }
 
-async fn maybe_auto_dismiss(client: &Client, db: &Database, config: &Config) -> Result<()> {
+async fn maybe_auto_dismiss(
+    client: &Client,
+    db: &Database,
+    config: &Config,
+    workspace: &Workspace,
+) -> Result<()> {
     if !config
         .workspaces
         .iter()
@@ -767,17 +792,24 @@ async fn maybe_auto_dismiss(client: &Client, db: &Database, config: &Config) -> 
     {
         return Ok(());
     }
-    let _ = dismiss_closed_merged(client, db).await?;
+    let _ = dismiss_closed_merged(client, db, workspace).await?;
     Ok(())
 }
 
-/// Mark read any unread pull-request threads whose PR is closed and merged.
-/// Returns the number dismissed. Used by the auto-dismiss option and by a
-/// manual "dismiss closed/merged" action in the UI.
-pub async fn dismiss_closed_merged(client: &Client, db: &Database) -> Result<usize> {
+/// Mark read any unread pull-request threads whose PR is closed and merged,
+/// limited to the given workspace's repos. Returns the number dismissed. Used
+/// by the auto-dismiss option and by a manual "dismiss closed/merged" action
+/// in the UI.
+pub async fn dismiss_closed_merged(
+    client: &Client,
+    db: &Database,
+    workspace: &Workspace,
+) -> Result<usize> {
     let mut count = 0;
     let mut seen = BTreeSet::new();
-    for (thread_id, thread_api_url, subject_api_url) in db.get_unread_pr_threads()? {
+    for (thread_id, thread_api_url, subject_api_url) in
+        db.get_unread_pr_threads(&workspace.tracked_repos())?
+    {
         if !seen.insert(subject_api_url.clone()) {
             continue;
         }
@@ -1632,5 +1664,96 @@ mod tests {
         });
         assert_eq!(state, "failure");
         assert_eq!(url, "https://github.com/o/r/actions/runs/123");
+    }
+
+    #[tokio::test]
+    async fn dismiss_closed_merged_only_touches_workspace_repos() {
+        use crate::models::{NotificationThread, ThreadRepository, ThreadSubject};
+        use axum::routing::{get, patch};
+        use axum::Router;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+
+        let work_calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/repos/o/r/pulls/7",
+                get(|| async {
+                    r#"{"state":"closed","merged_at":"2026-02-01T00:00:00Z","html_url":"https://github.com/o/r/pull/7"}"#
+                }),
+            )
+            .route(
+                "/repos/work/r/pulls/99",
+                get({
+                    let calls = work_calls.clone();
+                    move || {
+                        let calls = calls.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            r#"{"state":"closed","merged_at":"2026-02-01T00:00:00Z","html_url":"https://github.com/work/r/pull/99"}"#
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/notifications/threads/1",
+                patch(|| async { axum::http::StatusCode::RESET_CONTENT }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("db");
+        let thread = |id: &str, num: u32, repo: &str, url: &str| NotificationThread {
+            id: id.into(),
+            unread: true,
+            reason: "mention".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            last_read_at: None,
+            subject: ThreadSubject {
+                title: "pr".into(),
+                kind: "PullRequest".into(),
+                url: Some(format!("{base}{url}")),
+                latest_comment_url: None,
+            },
+            repository: Some(ThreadRepository {
+                full_name: repo.into(),
+                html_url: format!("https://github.com/{repo}"),
+            }),
+            url: format!("https://api.github.com/notifications/threads/{num}"),
+        };
+        // A merged PR on the workspace's repo, and one on a repo outside it.
+        db.upsert_thread(&thread("1:in", 1, "o/r", "/repos/o/r/pulls/7"))
+            .expect("in");
+        db.upsert_thread(&thread("2:work", 2, "work/r", "/repos/work/r/pulls/99"))
+            .expect("work");
+
+        let ws = crate::config::Workspace {
+            name: "test".into(),
+            auto_dismiss_closed_merged: false,
+            repo_sets: vec![crate::config::RepoSet {
+                name: "set".into(),
+                repos: vec!["o/r".into()],
+            }],
+        };
+        let client = Client::with_base(
+            Arc::new(crate::auth::pat::ClassicPat::new("ghp_x".into())),
+            &base,
+        );
+
+        let count = dismiss_closed_merged(&client, &db, &ws)
+            .await
+            .expect("dismiss");
+        assert_eq!(count, 1, "the workspace repo's merged PR is dismissed");
+        assert_eq!(
+            work_calls.load(Ordering::SeqCst),
+            0,
+            "the out-of-workspace PR must not be fetched"
+        );
     }
 }

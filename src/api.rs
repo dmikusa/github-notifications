@@ -756,10 +756,16 @@ async fn dismiss_closed_merged(State(state): State<AppState>) -> Response {
         s.last_dismiss = None;
     }
     // The pass can be slow (one fetch per unread PR thread), so run it in the
-    // background and report progress via /api/sync/status.
+    // background and report progress via /api/sync/status. It only touches the
+    // active workspace's repos.
     let worker = state.clone();
     tokio::spawn(async move {
-        let result = crate::sync::dismiss_closed_merged(&worker.github, &worker.db).await;
+        let ws = {
+            let cfg = worker.config.read().expect("config lock poisoned");
+            let name = worker.current_workspace.lock().expect("lock").clone();
+            views::resolve_workspace(&cfg, &name).clone()
+        };
+        let result = crate::sync::dismiss_closed_merged(&worker.github, &worker.db, &ws).await;
         let mut s = worker.sync_status.lock().expect("sync status poisoned");
         s.dismiss_running = false;
         match result {

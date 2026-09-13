@@ -289,12 +289,14 @@ async function refreshStatusLine() {
     });
 
     // Manual "dismiss closed/merged" from the inbox view. Runs in the
-    // background; poll /api/sync/status until it reports completion.
+    // background; poll /api/sync/status until it reports completion. The
+    // button swaps its icon for a spinner while the pass runs.
     document.addEventListener('click', async (e) => {
-      if (e.target.id !== 'dismiss-closed-merged') return;
-      const btn = e.target;
-      if (btn.classList.contains('working')) return;
+      const btn = e.target.closest('#dismiss-closed-merged');
+      if (!btn || btn.classList.contains('working')) return;
+      const originalHtml = btn.innerHTML;
       btn.classList.add('working');
+      btn.innerHTML = '<span class="spinner" aria-hidden="true"></span>Dismiss all closed/merged';
       window.App.flash.show('Dismissing closed/merged notifications\u2026');
       try {
         await window.App.api.postJSON('/api/notifications/dismiss-closed-merged', {});
@@ -317,6 +319,7 @@ async function refreshStatusLine() {
         window.App.flash.show(`Dismiss failed: ${err.message}`, true);
       } finally {
         btn.classList.remove('working');
+        btn.innerHTML = originalHtml;
       }
     });
 
