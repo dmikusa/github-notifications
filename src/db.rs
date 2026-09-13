@@ -52,6 +52,8 @@ pub struct QueueItem {
 #[derive(Debug, Default)]
 pub struct QueueFilter<'a> {
     pub repos: &'a [String],
+    /// Issue/PR author logins to include (empty = all).
+    pub authors: &'a [String],
     pub kind: Option<&'a str>,
     pub unread_only: bool,
     pub search: Option<&'a str>,
@@ -85,6 +87,8 @@ pub struct InboxItem {
 #[derive(Debug, Default)]
 pub struct InboxFilter<'a> {
     pub repos: &'a [String],
+    /// PR/issue author logins to include (empty = all).
+    pub authors: &'a [String],
     pub subject_type: Option<&'a str>,
     pub reason: Option<&'a str>,
     pub unread_only: bool,
@@ -781,6 +785,13 @@ CREATE TABLE IF NOT EXISTS org_repos (
             sql.push_str(" AND i.kind = ?");
             params.push(Box::new(kind.to_string()));
         }
+        if !f.authors.is_empty() {
+            let clause = in_unnumbered(f.authors.len());
+            sql.push_str(&format!(" AND i.author IN {clause}"));
+            for a in f.authors {
+                params.push(Box::new(a.clone()));
+            }
+        }
         if f.unread_only {
             sql.push_str(
                 " AND EXISTS (SELECT 1 FROM threads t
@@ -848,6 +859,13 @@ CREATE TABLE IF NOT EXISTS org_repos (
             sql.push_str(" AND t.subject_type = ?");
             params.push(Box::new(kind.to_string()));
         }
+        if !f.authors.is_empty() {
+            let clause = in_unnumbered(f.authors.len());
+            sql.push_str(&format!(" AND t.subject_author IN {clause}"));
+            for a in f.authors {
+                params.push(Box::new(a.clone()));
+            }
+        }
         if let Some(reason) = f.reason.filter(|s| *s != "all") {
             sql.push_str(" AND t.reason = ?");
             params.push(Box::new(reason.to_string()));
@@ -885,6 +903,64 @@ CREATE TABLE IF NOT EXISTS org_repos (
             .context("querying inbox")?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("reading inbox")
+    }
+
+    /// Distinct issue/PR author logins for the given repos (queue filter).
+    pub fn queue_authors(&self, repos: &[String]) -> Result<Vec<String>> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let mut sql = String::from(
+            "SELECT DISTINCT i.author FROM issues i JOIN repos r ON r.id = i.repo_id
+             WHERE i.author IS NOT NULL",
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if !repos.is_empty() {
+            let clause = in_clause(repos.len());
+            sql.push_str(&format!(" AND r.full_name IN {clause}"));
+            for repo in repos {
+                params.push(Box::new(repo.clone()));
+            }
+        }
+        sql.push_str(" ORDER BY i.author");
+        let mut stmt = conn.prepare(&sql).context("preparing queue authors")?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                row.get::<_, String>(0)
+            })
+            .context("querying queue authors")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("reading queue author")?);
+        }
+        Ok(out)
+    }
+
+    /// Distinct PR/issue author logins for the given repos (inbox filter).
+    pub fn inbox_authors(&self, repos: &[String]) -> Result<Vec<String>> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let mut sql = String::from(
+            "SELECT DISTINCT t.subject_author FROM threads t JOIN repos r ON r.id = t.repo_id
+             WHERE t.subject_author IS NOT NULL",
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if !repos.is_empty() {
+            let clause = in_clause(repos.len());
+            sql.push_str(&format!(" AND r.full_name IN {clause}"));
+            for repo in repos {
+                params.push(Box::new(repo.clone()));
+            }
+        }
+        sql.push_str(" ORDER BY t.subject_author");
+        let mut stmt = conn.prepare(&sql).context("preparing inbox authors")?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                row.get::<_, String>(0)
+            })
+            .context("querying inbox authors")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("reading inbox author")?);
+        }
+        Ok(out)
     }
 
     /// List repos that are watched or tracked by the workspace.
@@ -1115,6 +1191,13 @@ fn in_clause(count: usize) -> String {
     format!("({})", placeholders.join(","))
 }
 
+/// Build an unnumbered `(?, ?, ...)` placeholder clause for `count` values,
+/// for use after `in_clause` in the same query.
+fn in_unnumbered(count: usize) -> String {
+    let placeholders = std::iter::repeat_n("?", count).collect::<Vec<_>>();
+    format!("({})", placeholders.join(","))
+}
+
 /// Split an `owner/repo` full name into its parts. Falls back to treating the
 /// whole string as the repo name when there is no slash.
 fn split_repo(full_name: &str) -> (&str, &str) {
@@ -1296,6 +1379,7 @@ mod tests {
         let with_filter = |repos: &[String], unread_only: bool| {
             db.list_inbox(&InboxFilter {
                 repos,
+                authors: &[],
                 subject_type: None,
                 reason: None,
                 unread_only,
@@ -1506,5 +1590,138 @@ mod tests {
         // open row is stale and must be removed.
         db.delete_stale_issues_not_in(repo_id, &[]).expect("delete");
         assert_eq!(db.count("issues").expect("count"), 0);
+    }
+
+    #[test]
+    fn list_queue_filters_by_multiple_authors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("open");
+        let repo_id = db
+            .upsert_repo("o/r", Some("https://github.com/o/r"))
+            .expect("repo");
+        let issue = |login: &str, n: u64| crate::models::GithubIssue {
+            id: n,
+            number: n,
+            title: "t".into(),
+            state: "open".into(),
+            user: Some(crate::models::GithubUser {
+                login: login.into(),
+            }),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            closed_at: None,
+            html_url: format!("https://github.com/o/r/issues/{n}"),
+            url: format!("https://api.github.com/repos/o/r/issues/{n}"),
+            pull_request: None,
+        };
+        db.upsert_issue(repo_id, &issue("alice", 1), "issue", None)
+            .expect("a");
+        db.upsert_issue(repo_id, &issue("bob", 2), "issue", None)
+            .expect("b");
+        let q = db
+            .list_queue(&QueueFilter {
+                repos: &["o/r".into()],
+                authors: &["alice".into(), "bob".into()],
+                kind: None,
+                unread_only: false,
+                search: None,
+                sort: "created",
+            })
+            .expect("queue");
+        assert_eq!(
+            q.len(),
+            2,
+            "expected 2 rows for both authors, got {:?}",
+            q.iter().map(|i| i.author.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn queue_and_inbox_filter_by_author() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("open");
+        let repo_id = db
+            .upsert_repo("o/r", Some("https://github.com/o/r"))
+            .expect("repo");
+        let issue = |login: &str, n: u64| crate::models::GithubIssue {
+            id: n,
+            number: n,
+            title: "t".into(),
+            state: "open".into(),
+            user: Some(crate::models::GithubUser {
+                login: login.into(),
+            }),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            closed_at: None,
+            html_url: format!("https://github.com/o/r/issues/{n}"),
+            url: format!("https://api.github.com/repos/o/r/issues/{n}"),
+            pull_request: None,
+        };
+        db.upsert_issue(repo_id, &issue("alice", 1), "issue", None)
+            .expect("alice issue");
+        db.upsert_issue(repo_id, &issue("bob", 2), "issue", None)
+            .expect("bob issue");
+
+        let queue = db
+            .list_queue(&QueueFilter {
+                repos: &["o/r".into()],
+                authors: &["alice".into()],
+                kind: None,
+                unread_only: false,
+                search: None,
+                sort: "created",
+            })
+            .expect("queue");
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].author.as_deref(), Some("alice"));
+
+        // Inbox: threads have their subject author cached separately.
+        let thread = crate::models::NotificationThread {
+            id: "1:111".into(),
+            unread: true,
+            reason: "mention".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            last_read_at: None,
+            subject: crate::models::ThreadSubject {
+                title: "t".into(),
+                kind: "PullRequest".into(),
+                url: Some("https://api.github.com/repos/o/r/pulls/1".into()),
+                latest_comment_url: None,
+            },
+            repository: Some(crate::models::ThreadRepository {
+                full_name: "o/r".into(),
+                html_url: "https://github.com/o/r".into(),
+            }),
+            url: "https://api.github.com/notifications/threads/111".into(),
+        };
+        db.upsert_thread(&thread).expect("thread");
+        db.set_subject_author("1:111", Some("alice"))
+            .expect("author");
+
+        let inbox = db
+            .list_inbox(&InboxFilter {
+                repos: &["o/r".into()],
+                authors: &["bob".into()],
+                subject_type: None,
+                reason: None,
+                unread_only: false,
+                sort: "updated",
+            })
+            .expect("inbox bob");
+        assert!(inbox.is_empty());
+
+        let inbox = db
+            .list_inbox(&InboxFilter {
+                repos: &["o/r".into()],
+                authors: &["alice".into()],
+                subject_type: None,
+                reason: None,
+                unread_only: false,
+                sort: "updated",
+            })
+            .expect("inbox alice");
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].subject_author.as_deref(), Some("alice"));
     }
 }

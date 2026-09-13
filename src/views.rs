@@ -55,6 +55,8 @@ struct QueueTemplate<'a> {
     unread: bool,
     q: &'a str,
     sort: &'a str,
+    authors: &'a [AuthorOption],
+    selected: &'a str,
     items: &'a [db::QueueItem],
 }
 
@@ -62,8 +64,10 @@ struct QueueTemplate<'a> {
 /// decides how to present the initial-loading state via `/api/sync/status`.
 pub fn render_queue(db: &Database, workspace: &Workspace, q: &QueueParams) -> Result<String> {
     let repos = repos_for_filter(workspace, &q.repo_set);
+    let authors = split_authors(&q.author);
     let filter = db::QueueFilter {
         repos: &repos,
+        authors: &authors,
         kind: if q.kind == "all" || q.kind.is_empty() {
             None
         } else {
@@ -75,6 +79,7 @@ pub fn render_queue(db: &Database, workspace: &Workspace, q: &QueueParams) -> Re
     };
     let items = db.list_queue(&filter)?;
     let repo_sets = repo_set_names(workspace);
+    let options = author_options(db.queue_authors(&repos)?, &authors);
     let template = QueueTemplate {
         ws: &workspace.name,
         repo_set: if q.repo_set.is_empty() {
@@ -87,6 +92,8 @@ pub fn render_queue(db: &Database, workspace: &Workspace, q: &QueueParams) -> Re
         unread: q.unread,
         q: &q.q,
         sort: &q.sort,
+        authors: &options,
+        selected: &q.author,
         items: &items,
     };
     template.render().context("rendering queue view")
@@ -102,14 +109,18 @@ struct InboxTemplate<'a> {
     reason: &'a str,
     unread: bool,
     sort: &'a str,
+    authors: &'a [AuthorOption],
+    selected: &'a str,
     items: &'a [db::InboxItem],
 }
 
 /// Render the inbox view fragment for `workspace`.
 pub fn render_inbox(db: &Database, workspace: &Workspace, q: &InboxParams) -> Result<String> {
     let repos = repos_for_filter(workspace, &q.repo_set);
+    let authors = split_authors(&q.author);
     let filter = db::InboxFilter {
         repos: &repos,
+        authors: &authors,
         subject_type: filter_value(&q.subject_type),
         reason: filter_value(&q.reason),
         unread_only: q.unread,
@@ -117,6 +128,7 @@ pub fn render_inbox(db: &Database, workspace: &Workspace, q: &InboxParams) -> Re
     };
     let items = db.list_inbox(&filter)?;
     let repo_sets = repo_set_names(workspace);
+    let options = author_options(db.inbox_authors(&repos)?, &authors);
     let template = InboxTemplate {
         ws: &workspace.name,
         repo_set: if q.repo_set.is_empty() {
@@ -129,9 +141,28 @@ pub fn render_inbox(db: &Database, workspace: &Workspace, q: &InboxParams) -> Re
         reason: &q.reason,
         unread: q.unread,
         sort: &q.sort,
+        authors: &options,
+        selected: &q.author,
         items: &items,
     };
     template.render().context("rendering inbox view")
+}
+
+/// One author in the multi-select filter, with its selected state.
+pub struct AuthorOption {
+    pub name: String,
+    pub selected: bool,
+}
+
+/// Mark which authors are currently selected in the filter.
+fn author_options(names: Vec<String>, selected: &[String]) -> Vec<AuthorOption> {
+    names
+        .into_iter()
+        .map(|name| AuthorOption {
+            selected: selected.iter().any(|s| s == &name),
+            name,
+        })
+        .collect()
 }
 
 #[derive(Template)]
@@ -186,6 +217,8 @@ pub struct QueueParams {
     pub unread: bool,
     pub q: String,
     pub sort: String,
+    /// PR/issue authors to include, comma-separated.
+    pub author: String,
 }
 
 /// Query params for the inbox view.
@@ -199,6 +232,18 @@ pub struct InboxParams {
     pub reason: String,
     pub unread: bool,
     pub sort: String,
+    /// PR/issue authors to include, comma-separated.
+    pub author: String,
+}
+
+/// Split a comma-separated author param into a list.
+fn split_authors(author: &str) -> Vec<String> {
+    author
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Query params for the repos view.
@@ -279,6 +324,7 @@ mod tests {
                 unread: false,
                 q: String::new(),
                 sort: "attention".into(),
+                author: String::new(),
             },
         )
         .expect("render");
@@ -328,6 +374,7 @@ mod tests {
             unread: false,
             q: String::new(),
             sort: "attention".into(),
+            author: String::new(),
         };
         // Only set-a's repo.
         let html = render_queue(&db, &ws, &params("set-a")).expect("render set-a");
@@ -364,6 +411,7 @@ mod tests {
                 unread: false,
                 q: String::new(),
                 sort: "attention".into(),
+                author: String::new(),
             },
         )
         .expect("render");
@@ -393,6 +441,7 @@ mod tests {
                 reason: "all".into(),
                 unread: false,
                 sort: "updated".into(),
+                author: String::new(),
             },
         )
         .expect("render");
@@ -454,6 +503,7 @@ mod tests {
                 reason: "all".into(),
                 unread: false,
                 sort: "updated".into(),
+                author: String::new(),
             },
         )
         .expect("render");
@@ -485,11 +535,13 @@ mod tests {
                 unread: false,
                 q: String::new(),
                 sort: "attention".into(),
+                author: String::new(),
             },
         )
         .expect("render");
-        // Repo set, kind, unread checkbox, and sort all reload on `change`.
-        assert_eq!(html.matches(r#"hx-trigger="change""#).count(), 4);
+        // Repo set, kind, unread checkbox, sort, and the author popover all
+        // reload on `change`.
+        assert_eq!(html.matches(r#"hx-trigger="change""#).count(), 5);
         assert!(html.contains(r#"hx-get="/api/views/queue""#));
         assert!(html.contains(r#"hx-include="closest form""#));
         // The unread checkbox must submit a value serde parses as `bool`; the
@@ -520,11 +572,12 @@ mod tests {
                 reason: "all".into(),
                 unread: false,
                 sort: "updated".into(),
+                author: String::new(),
             },
         )
         .expect("render");
         // Repo set, type, reason, unread checkbox, and sort all reload on `change`.
-        assert_eq!(html.matches(r#"hx-trigger="change""#).count(), 5);
+        assert_eq!(html.matches(r#"hx-trigger="change""#).count(), 6);
         assert!(html.contains(r#"hx-get="/api/views/inbox""#));
         assert!(html.contains(r#"hx-include="closest form""#));
         assert!(html.contains(r#"name="unread" value="true""#));

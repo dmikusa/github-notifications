@@ -80,6 +80,7 @@ window.App.views = (() => {
     const newEl = document.getElementById('view');
     if (newEl && window.htmx) htmx.process(newEl);
     window.App.filters.capture(view);
+    window.App.filters.afterSwap();
     window.App.table.bind();
     if (view === 'settings') {
       window.App.settings.bind();
@@ -340,4 +341,5 @@ async function refreshStatusLine() {
 document.addEventListener('htmx:afterSwap', () => {
   window.App.table.bind();
   window.App.filters.capture(window.App.state.currentView);
+  window.App.filters.afterSwap();
 });
