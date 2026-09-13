@@ -21,7 +21,13 @@ window.App.table = (() => {
     const bar = root.querySelector('.bulk-bar');
     const count = root.querySelector('.sel-count');
     const sel = selected();
-    if (bar) bar.hidden = sel.length === 0;
+    // The action buttons stay visible at all times so the layout never shifts;
+    // they're just disabled until something is selected.
+    if (bar) {
+      bar.querySelectorAll('button[data-action]').forEach((btn) => {
+        btn.disabled = sel.length === 0;
+      });
+    }
     if (count) count.textContent = sel.length ? `${sel.length} selected` : '';
   }
 
@@ -48,6 +54,8 @@ window.App.table = (() => {
         btn.addEventListener('click', () => runAction(btn.dataset.action));
       });
     }
+    // Disable the action buttons until something is selected.
+    updateBulkBar();
   }
 
   async function runAction(action) {
