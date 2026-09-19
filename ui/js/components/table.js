@@ -5,6 +5,16 @@
 window.App = window.App || {};
 
 window.App.table = (() => {
+  // The row checkbox a plain click last landed on. Shift-clicking another row
+  // selects (or deselects) everything between the two. Kept fixed across
+  // successive shift-clicks so a range can be expanded, and reset whenever the
+  // rows are re-rendered (see bind).
+  let anchor = null;
+
+  function rows(root) {
+    return Array.from((root || document.querySelector('#view'))?.querySelectorAll('.sel') || []);
+  }
+
   function selected() {
     return Array.from(document.querySelectorAll('#view .sel:checked')).map((cb) => cb.value);
   }
@@ -13,6 +23,16 @@ window.App.table = (() => {
     return Array.from(document.querySelectorAll('#view .sel:checked'))
       .map((cb) => cb.dataset.htmlUrl)
       .filter(Boolean);
+  }
+
+  // Apply `to`'s checked state to every row between the anchor and `to`,
+  // inclusive — the familiar shift-click range select.
+  function applyRange(boxes, from, to) {
+    const a = boxes.indexOf(from);
+    const b = boxes.indexOf(to);
+    if (a === -1 || b === -1) return;
+    const [lo, hi] = a < b ? [a, b] : [b, a];
+    for (let i = lo; i <= hi; i++) boxes[i].checked = to.checked;
   }
 
   function updateBulkBar() {
@@ -29,11 +49,23 @@ window.App.table = (() => {
       });
     }
     if (count) count.textContent = sel.length ? `${sel.length} selected` : '';
+    // Reflect partial selection on the header checkbox (checked when all rows
+    // are selected, indeterminate when some are).
+    const selAll = root.querySelector('.sel-all');
+    if (selAll) {
+      const boxes = rows(root);
+      const checked = boxes.filter((cb) => cb.checked).length;
+      selAll.checked = boxes.length > 0 && checked === boxes.length;
+      selAll.indeterminate = checked > 0 && checked < boxes.length;
+    }
   }
 
   function bind() {
     const root = document.querySelector('#view');
     if (!root) return;
+
+    // Fresh rows invalidate the old anchor element.
+    anchor = null;
 
     const selAll = root.querySelector('.sel-all');
     if (selAll) {
@@ -41,11 +73,21 @@ window.App.table = (() => {
         root.querySelectorAll('.sel').forEach((cb) => {
           cb.checked = selAll.checked;
         });
+        selAll.indeterminate = false;
         updateBulkBar();
       });
     }
     root.querySelectorAll('.sel').forEach((cb) => {
       cb.addEventListener('change', updateBulkBar);
+      cb.addEventListener('click', (e) => {
+        const boxes = rows(root);
+        if (e.shiftKey && anchor && anchor !== cb && boxes.includes(anchor)) {
+          applyRange(boxes, anchor, cb);
+          updateBulkBar();
+        } else {
+          anchor = cb;
+        }
+      });
     });
 
     const bar = root.querySelector('.bulk-bar');
