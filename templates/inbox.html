@@ -41,6 +41,17 @@
       <option value="updated" {% if sort == "updated" %}selected{% endif %}>Updated</option>
       <option value="repo" {% if sort == "repo" %}selected{% endif %}>Repo</option>
     </select>
+    <input type="hidden" name="author" value="{{ selected }}">
+    <div class="multi-select" data-popover="author">
+      <button type="button" class="filter-btn" data-toggle>Author &#9662;</button>
+      <div class="multi-select-pop" hidden
+           hx-get="/api/views/inbox" hx-target="#view" hx-swap="outerHTML"
+           hx-trigger="change" hx-include="closest form">
+        {% for a in authors %}
+        <label><input type="checkbox" class="author-opt" value="{{ a.name }}" {% if a.selected %}checked{% endif %}> {{ a.name }}</label>
+        {% endfor %}
+      </div>
+    </div>
     <div class="view-actions">
       <button type="button" id="dismiss-closed-merged" class="sweep-btn" title="Dismiss notifications for closed or merged PRs">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 4h11"/><path d="M6 2.5h4"/><path d="M3.5 4l.7 9a1 1 0 0 0 1 .9h5.6a1 1 0 0 0 1-.9l.7-9"/></svg>

@@ -30,6 +30,17 @@
       <option value="created" {% if sort == "created" %}selected{% endif %}>Created</option>
       <option value="repo" {% if sort == "repo" %}selected{% endif %}>Repo</option>
     </select>
+    <input type="hidden" name="author" value="{{ selected }}">
+    <div class="multi-select" data-popover="author">
+      <button type="button" class="filter-btn" data-toggle>Author &#9662;</button>
+      <div class="multi-select-pop" hidden
+           hx-get="/api/views/queue" hx-target="#view" hx-swap="outerHTML"
+           hx-trigger="change" hx-include="closest form">
+        {% for a in authors %}
+        <label><input type="checkbox" class="author-opt" value="{{ a.name }}" {% if a.selected %}checked{% endif %}> {{ a.name }}</label>
+        {% endfor %}
+      </div>
+    </div>
   </form>
 
   <table class="data">
