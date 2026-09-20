@@ -2,17 +2,17 @@
   <h2 class="view-title">Repo sets for workspace &ldquo;{{ ws }}&rdquo;</h2>
 
   <div id="repo-sets" class="repo-set-list">
-    {% for set in repo_sets %}
+    {% for rs in repo_sets %}
     <div class="repo-set card">
       <div class="repo-set-head">
-        <strong>{{ set.name }}</strong>
-        <button class="danger" data-action="remove-set" data-set="{{ set.name }}">Remove</button>
+        <strong>{{ rs.name }}</strong>
+        <button class="danger" data-action="remove-set" data-set="{{ rs.name }}">Remove</button>
       </div>
       <ul class="repo-list">
-        {% for repo in set.repos %}
+        {% for repo in rs.repos %}
         <li>
           {{ repo }}
-          <button data-action="remove-repo" data-set="{{ set.name }}" data-repo="{{ repo }}">x</button>
+          <button data-action="remove-repo" data-set="{{ rs.name }}" data-repo="{{ repo }}">x</button>
         </li>
         {% else %}
         <li class="muted">No repos.</li>

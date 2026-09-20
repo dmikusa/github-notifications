@@ -391,8 +391,8 @@ CREATE TABLE IF NOT EXISTS org_repos (
                created_at = COALESCE(issues.created_at, excluded.created_at)",
             params![
                 repo_id,
-                issue.id,
-                issue.number,
+                issue.id as i64,
+                issue.number as i64,
                 kind,
                 issue.title,
                 issue.state,
