@@ -809,19 +809,28 @@ async fn maybe_auto_dismiss(
     {
         return Ok(());
     }
-    let _ = dismiss_closed_merged(client, db, workspace).await?;
+    let _ =
+        dismiss_closed_merged(client, db, workspace, config.github.sync_dismiss_to_github).await?;
     Ok(())
 }
 /// Remove every pull-request notification thread whose PR is closed (whether
-/// merged or not), limited to the given workspace's repos. Unread threads
-/// are marked read on GitHub; all such threads are dropped from the local
-/// cache and remembered so the next notification sync doesn't re-add them.
-/// Returns the number dismissed. Used by the auto-dismiss option and by a
-/// manual "dismiss closed/merged" action in the UI.
+/// merged or not), limited to the given workspace's repos.
+///
+/// When `sync_to_github` is `false` this is local-only: it uses each thread's
+/// cached `subject_state` and makes no GitHub calls, so it is fast. States not
+/// already known to be closed are left for the next sync to resolve. When
+/// `true`, each PR's state is re-checked on GitHub (conditional requests) and
+/// unread dismissed threads are marked read there too.
+///
+/// Dismissed threads are dropped from the local cache and remembered so the
+/// next notification sync doesn't re-add them. Returns the number dismissed.
+/// Used by the auto-dismiss option and by a manual "dismiss closed/merged"
+/// action in the UI.
 pub async fn dismiss_closed_merged(
     client: &Client,
     db: &Database,
     workspace: &Workspace,
+    sync_to_github: bool,
 ) -> Result<usize> {
     let mut count = 0;
     let mut dismissed_ids = Vec::new();
@@ -833,12 +842,20 @@ pub async fn dismiss_closed_merged(
         let Some(numeric_id) = thread.api_url.rsplit('/').next().map(str::to_string) else {
             continue;
         };
-        let subject_closed = match closed.get(&thread.subject_api_url) {
-            Some(m) => *m,
-            None => {
-                let m = match thread.subject_state.as_deref() {
-                    Some("merged") | Some("closed") => true,
-                    _ => {
+        let cached_closed = matches!(
+            thread.subject_state.as_deref(),
+            Some("merged") | Some("closed")
+        );
+        let subject_closed = if !sync_to_github {
+            // Local-only: trust the cache and make no network calls.
+            cached_closed
+        } else {
+            match closed.get(&thread.subject_api_url) {
+                Some(m) => *m,
+                None => {
+                    let m = if cached_closed {
+                        true
+                    } else {
                         let etag_key = format!("etag:pr:{}", thread.subject_api_url);
                         let etag = db.get_sync_state(&etag_key)?;
                         let response = client
@@ -857,16 +874,16 @@ pub async fn dismiss_closed_merged(
                                 Err(_) => false,
                             }
                         }
-                    }
-                };
-                closed.insert(thread.subject_api_url.clone(), m);
-                m
+                    };
+                    closed.insert(thread.subject_api_url.clone(), m);
+                    m
+                }
             }
         };
         if !subject_closed {
             continue;
         }
-        if thread.unread {
+        if sync_to_github && thread.unread {
             let path = format!("/notifications/threads/{numeric_id}");
             let res = client.patch(&path).await?;
             if !matches!(
@@ -1764,7 +1781,9 @@ mod tests {
             &base,
         );
 
-        let count = dismiss_closed_merged(&client, &db, &ws)
+        // With GitHub sync on, the workspace PR is fetched and its thread marked
+        // read via PATCH; the out-of-workspace PR is never touched.
+        let count = dismiss_closed_merged(&client, &db, &ws, true)
             .await
             .expect("dismiss");
         assert_eq!(count, 1, "the workspace repo's merged PR is dismissed");
@@ -1773,6 +1792,104 @@ mod tests {
             0,
             "the out-of-workspace PR must not be fetched"
         );
+    }
+
+    #[tokio::test]
+    async fn dismiss_closed_merged_local_only_makes_no_github_calls() {
+        use crate::models::{NotificationThread, ThreadRepository, ThreadSubject};
+        use axum::Router;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+
+        // Any request at all is a failure for the local-only path, so count
+        // every call and assert it stays zero.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().fallback({
+            let calls = calls.clone();
+            move || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }
+        });
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("db");
+        db.upsert_repo("o/r", Some("https://github.com/o/r"))
+            .expect("repo");
+        let thread = |id: &str, num: u32, subject_url: &str| NotificationThread {
+            id: id.into(),
+            unread: true,
+            reason: "mention".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            last_read_at: None,
+            subject: ThreadSubject {
+                title: "pr".into(),
+                kind: "PullRequest".into(),
+                url: Some(format!("{base}{subject_url}")),
+                latest_comment_url: None,
+            },
+            repository: Some(ThreadRepository {
+                full_name: "o/r".into(),
+                html_url: "https://github.com/o/r".into(),
+            }),
+            url: format!("https://api.github.com/notifications/threads/{num}"),
+        };
+        db.upsert_thread(&thread("1:closed", 1, "/repos/o/r/pulls/1"))
+            .expect("closed thread");
+        db.upsert_thread(&thread("2:open", 2, "/repos/o/r/pulls/2"))
+            .expect("open thread");
+        // Cached states: one known closed, one known open.
+        db.set_subject_state(
+            "1:closed",
+            "closed",
+            Some("https://github.com/o/r/pull/1"),
+            None,
+            "2026-01-02T00:00:00Z",
+        )
+        .expect("state closed");
+        db.set_subject_state(
+            "2:open",
+            "open",
+            Some("https://github.com/o/r/pull/2"),
+            None,
+            "2026-01-02T00:00:00Z",
+        )
+        .expect("state open");
+
+        let ws = crate::config::Workspace {
+            name: "test".into(),
+            auto_dismiss_closed_merged: false,
+            repo_sets: vec![crate::config::RepoSet {
+                name: "set".into(),
+                repos: vec!["o/r".into()],
+            }],
+        };
+        let client = Client::with_base(
+            Arc::new(crate::auth::pat::ClassicPat::new("ghp_x".into())),
+            &base,
+        );
+
+        let count = dismiss_closed_merged(&client, &db, &ws, false)
+            .await
+            .expect("dismiss");
+        assert_eq!(count, 1, "only the cached-closed thread is dismissed");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "local-only dismiss must not call GitHub"
+        );
+        // The open thread stays cached; the closed one is gone.
+        assert_eq!(db.count("threads").expect("count"), 1);
     }
 
     #[tokio::test]
