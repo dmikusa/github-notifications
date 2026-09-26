@@ -67,7 +67,7 @@
           {% if item.kind == "pr" && item.merged_at.is_some() %}<span class="badge status-merged">merged</span>
           {% else %}<span class="badge status-{{ item.state }}">{{ item.state }}</span>{% endif %}
         </td>
-        <td class="time">{{ item.updated_at }}</td>
+        <td class="time">{{ item.activity_at }}</td>
       </tr>
       {% else %}
       <tr><td colspan="7" class="empty">No items match your filters.</td></tr>
