@@ -39,6 +39,11 @@ pub struct QueueItem {
     pub state: String,
     pub updated_at: String,
     pub created_at: String,
+    /// Shown in the "Updated" column: the latest notification thread activity
+    /// when the item has a thread, otherwise the issue/PR's created time.
+    /// GitHub's `updated_at` is intentionally not used — it is bumped by
+    /// metadata churn (e.g. bots adding/removing labels), not real activity.
+    pub activity_at: String,
     pub html_url: String,
     pub thread_unread: bool,
     pub thread_reason: Option<String>,
@@ -804,16 +809,21 @@ CREATE TABLE IF NOT EXISTS org_repos (
             params.push(Box::new(format!("%{search}%")));
         }
         let order = match f.sort {
-            "updated" => "ORDER BY i.updated_at DESC",
             "created" => "ORDER BY i.created_at DESC",
             "repo" => "ORDER BY r.full_name, i.number DESC",
-            _ => "ORDER BY COALESCE(thread_updated, i.updated_at) DESC",
+            // Attention (the default) and Updated now order identically: by the
+            // item's activity — the latest notification thread time when it has
+            // a thread, otherwise its opened date. GitHub's `updated_at` is not
+            // used because metadata churn (e.g. bots toggling labels) bumps it.
+            _ => "ORDER BY COALESCE(thread_updated, i.created_at) DESC",
         };
         sql.push_str(&format!(" {order}"));
 
         let mut stmt = conn.prepare(&sql).context("preparing queue query")?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                let created_at: String = row.get(7)?;
+                let thread_updated: Option<String> = row.get(11)?;
                 Ok(QueueItem {
                     id: row.get(0)?,
                     repo: row.get(1)?,
@@ -822,11 +832,12 @@ CREATE TABLE IF NOT EXISTS org_repos (
                     title: row.get(4)?,
                     state: row.get(5)?,
                     updated_at: row.get(6)?,
-                    created_at: row.get(7)?,
+                    activity_at: thread_updated.clone().unwrap_or_else(|| created_at.clone()),
+                    created_at,
                     html_url: row.get(8)?,
                     thread_unread: row.get::<_, i64>(9)? != 0,
                     thread_reason: row.get(10)?,
-                    thread_updated: row.get(11)?,
+                    thread_updated,
                     merged_at: row.get(12)?,
                     author: row.get(13)?,
                 })
@@ -1634,6 +1645,84 @@ mod tests {
             "expected 2 rows for both authors, got {:?}",
             q.iter().map(|i| i.author.clone()).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn list_queue_activity_uses_thread_then_created_at() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("open");
+        let repo_id = db
+            .upsert_repo("o/r", Some("https://github.com/o/r"))
+            .expect("repo");
+        let issue = |n: u64, created: &str, updated: &str| crate::models::GithubIssue {
+            id: n,
+            number: n,
+            title: format!("issue {n}"),
+            state: "open".into(),
+            user: None,
+            created_at: created.into(),
+            updated_at: updated.into(),
+            closed_at: None,
+            html_url: format!("https://github.com/o/r/issues/{n}"),
+            url: format!("https://api.github.com/repos/o/r/issues/{n}"),
+            pull_request: None,
+        };
+        // Issue 1 has no thread; its activity falls back to `created_at`.
+        db.upsert_issue(
+            repo_id,
+            &issue(1, "2021-12-08T16:22:53Z", "2026-09-22T01:24:59Z"),
+            "issue",
+            None,
+        )
+        .expect("issue 1");
+        // Issue 2 has a thread; its activity is the thread's `updated_at`.
+        db.upsert_issue(
+            repo_id,
+            &issue(2, "2022-01-01T00:00:00Z", "2023-01-01T00:00:00Z"),
+            "issue",
+            None,
+        )
+        .expect("issue 2");
+        let thread = crate::models::NotificationThread {
+            id: "1:2".into(),
+            unread: true,
+            reason: "comment".into(),
+            updated_at: "2025-06-01T00:00:00Z".into(),
+            last_read_at: None,
+            subject: crate::models::ThreadSubject {
+                title: "issue 2".into(),
+                kind: "Issue".into(),
+                url: Some("https://api.github.com/repos/o/r/issues/2".into()),
+                latest_comment_url: None,
+            },
+            repository: Some(crate::models::ThreadRepository {
+                full_name: "o/r".into(),
+                html_url: "https://github.com/o/r".into(),
+            }),
+            url: "https://api.github.com/notifications/threads/2".into(),
+        };
+        db.upsert_thread(&thread).expect("thread");
+
+        // Attention (the default) and Updated order identically.
+        for sort in ["attention", "updated"] {
+            let queue = db
+                .list_queue(&QueueFilter {
+                    repos: &["o/r".into()],
+                    authors: &[],
+                    kind: None,
+                    unread_only: false,
+                    search: None,
+                    sort,
+                })
+                .unwrap_or_else(|e| panic!("queue for {sort}: {e}"));
+            // The threaded issue (2025) sorts ahead of the fallback-to-created
+            // one (2021), even though the latter's raw `updated_at` (2026) is
+            // newer.
+            let numbers: Vec<i64> = queue.iter().map(|i| i.number).collect();
+            assert_eq!(numbers, vec![2, 1], "sort={sort}");
+            assert_eq!(queue[0].activity_at, "2025-06-01T00:00:00Z");
+            assert_eq!(queue[1].activity_at, "2021-12-08T16:22:53Z");
+        }
     }
 
     #[test]
