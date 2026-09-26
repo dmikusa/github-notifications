@@ -286,6 +286,16 @@ table.data tr.row-unread {
   background: #fff8e6;
 }
 
+/* Unread rows get a left accent stripe and a bold title, so read vs unread is
+   obvious at a glance (the pale row tint alone is easy to miss). */
+table.data tr.row-unread td:first-child {
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+table.data tr.row-unread td.title a {
+  font-weight: 700;
+}
+
 td.chk {
   width: 32px;
 }

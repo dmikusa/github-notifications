@@ -38,6 +38,11 @@ pub struct GithubConfig {
     pub repo_refresh_interval_seconds: u64,
     #[serde(default = "default_sync_concurrency")]
     pub sync_concurrency: u64,
+    /// When clearing closed/merged notifications, also sync with GitHub (re-check
+    /// each PR's state and mark dismissed threads read). Off by default so the
+    /// clear stays local and fast, using cached PR state.
+    #[serde(default)]
+    pub sync_dismiss_to_github: bool,
 }
 
 impl GithubConfig {
@@ -56,6 +61,7 @@ impl Default for GithubConfig {
             poll_interval_seconds: default_poll_interval(),
             repo_refresh_interval_seconds: default_repo_refresh_interval(),
             sync_concurrency: default_sync_concurrency(),
+            sync_dismiss_to_github: false,
         }
     }
 }
@@ -223,6 +229,13 @@ repo_refresh_interval_seconds = 600
 # How many GitHub API requests to make concurrently during a sync pass.
 # Must be between 1 and 10. Defaults to 3.
 sync_concurrency = 3
+
+# When clearing closed/merged notifications (the Inbox "Dismiss all
+# closed/merged" button, or a workspace's auto_dismiss_closed_merged), also
+# sync with GitHub: re-check each PR's state online and mark the dismissed
+# threads read there. Off by default, so clearing stays local and fast and
+# uses the PR state already cached from sync.
+sync_dismiss_to_github = false
 
 # Workspaces group repos and saved filters into separate views (e.g. personal
 # vs work). Each workspace has one or more repo sets: explicit lists of repos
@@ -485,6 +498,7 @@ mod tests {
                 poll_interval_seconds: 60,
                 repo_refresh_interval_seconds: 120,
                 sync_concurrency: 5,
+                sync_dismiss_to_github: true,
             },
             workspaces: vec![Workspace {
                 name: "personal".into(),
@@ -503,6 +517,7 @@ mod tests {
         assert_eq!(parsed.github.poll_interval_seconds, 60);
         assert_eq!(parsed.github.repo_refresh_interval_seconds, 120);
         assert_eq!(parsed.github.sync_concurrency, 5);
+        assert!(parsed.github.sync_dismiss_to_github);
         assert_eq!(parsed.workspaces[0].name, "personal");
         assert!(parsed.workspaces[0].auto_dismiss_closed_merged);
         assert_eq!(
@@ -524,6 +539,13 @@ mod tests {
         // Clamped to at most 10.
         cfg.sync_concurrency = 42;
         assert_eq!(cfg.effective_sync_concurrency(), 10);
+    }
+
+    #[test]
+    fn sync_dismiss_to_github_defaults_off() {
+        assert!(!GithubConfig::default().sync_dismiss_to_github);
+        let parsed: Config = toml::from_str(CONFIG_TEMPLATE).expect("template parses");
+        assert!(!parsed.github.sync_dismiss_to_github);
     }
 
     #[test]
