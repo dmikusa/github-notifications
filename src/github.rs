@@ -16,6 +16,63 @@ const DEFAULT_BASE: &str = "https://api.github.com";
 /// The GitHub API version we target.
 const API_VERSION: &str = "2022-11-28";
 
+/// How many times to retry a request that GitHub rate limited before giving up.
+const MAX_RATE_RETRIES: u32 = 3;
+
+/// Whether a response is a rate-limit rejection we should back off and retry.
+///
+/// Covers `429 Too Many Requests` and the secondary-rate-limit `403` GitHub
+/// returns with a "rate limit"/"abuse" message. A plain `403` (e.g. no access
+/// to a repo) is not retried.
+fn is_rate_limited(status: StatusCode, headers: &HeaderMap, body: &[u8]) -> bool {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return true;
+    }
+    if status != StatusCode::FORBIDDEN {
+        return false;
+    }
+    if headers.contains_key("retry-after") {
+        return true;
+    }
+    if headers
+        .get("x-ratelimit-remaining")
+        .and_then(|v| v.to_str().ok())
+        == Some("0")
+    {
+        return true;
+    }
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    text.contains("rate limit") || text.contains("abuse")
+}
+
+/// How long to wait before retrying a rate-limited request: honor `Retry-After`
+/// when present, otherwise exponential backoff (1s, 2s, 4s...). Capped so a
+/// sync can't hang for long; a 403 with a `x-ratelimit-reset` uses that only
+/// when it is a short wait.
+fn retry_delay(headers: &HeaderMap, attempt: u32) -> std::time::Duration {
+    use std::time::Duration;
+
+    if let Some(secs) = headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        return Duration::from_secs(secs.min(60));
+    }
+    if let Some(reset) = headers
+        .get("x-ratelimit-reset")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<i64>().ok())
+    {
+        let now = chrono::Utc::now().timestamp();
+        let wait = reset - now;
+        if wait > 0 {
+            return Duration::from_secs((wait as u64).min(60));
+        }
+    }
+    Duration::from_secs(1u64 << attempt.min(4))
+}
+
 /// Minimal authenticated GitHub REST API client.
 ///
 /// All requests carry the provider's bearer token. A 401 triggers a provider
@@ -85,6 +142,9 @@ impl Client {
         body: Option<String>,
     ) -> Result<GitResponse, ClientError> {
         let mut attempt = 0;
+        // Separate budget for rate-limit backoff retries so a 401 refresh and a
+        // transient 429 can't starve each other.
+        let mut rate_attempt = 0;
         loop {
             let token = self.token.token().await?;
             let mut builder = match method {
@@ -135,6 +195,25 @@ impl Client {
                 attempt += 1;
                 continue;
             }
+
+            // Retry with backoff on rate limiting: 429, or a 403 whose
+            // body/headers indicate a primary/secondary rate limit. Before this,
+            // a burst of concurrent requests could fail the whole sync.
+            if is_rate_limited(status, &headers, &body) && rate_attempt < MAX_RATE_RETRIES {
+                let delay = retry_delay(&headers, rate_attempt);
+                tracing::warn!(
+                    method,
+                    url,
+                    status = %status,
+                    delay_ms = delay.as_millis() as u64,
+                    attempt = rate_attempt + 1,
+                    "github rate limited; backing off"
+                );
+                tokio::time::sleep(delay).await;
+                rate_attempt += 1;
+                continue;
+            }
+
             return Ok(GitResponse {
                 status,
                 headers,
@@ -447,5 +526,105 @@ mod tests {
         let v = client.validate().await.expect("validate");
         assert!(v.ok);
         assert_eq!(v.login.as_deref(), Some("octocat"));
+    }
+
+    #[test]
+    fn detects_rate_limit_responses() {
+        let empty = HeaderMap::new();
+        // 429 is always rate limiting.
+        assert!(is_rate_limited(StatusCode::TOO_MANY_REQUESTS, &empty, b""));
+        // A 403 with a Retry-After header is a secondary limit.
+        let mut h = HeaderMap::new();
+        h.insert("retry-after", "5".parse().expect("header"));
+        assert!(is_rate_limited(StatusCode::FORBIDDEN, &h, b""));
+        // A 403 with a rate-limit message in the body.
+        assert!(is_rate_limited(
+            StatusCode::FORBIDDEN,
+            &empty,
+            br#"{"message":"You have exceeded a secondary rate limit"}"#
+        ));
+        // A 403 for missing access is not a rate limit.
+        assert!(!is_rate_limited(
+            StatusCode::FORBIDDEN,
+            &empty,
+            br#"{"message":"Resource not accessible by integration"}"#
+        ));
+        // 404 / 500 are not rate limits.
+        assert!(!is_rate_limited(StatusCode::NOT_FOUND, &empty, b""));
+        assert!(!is_rate_limited(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &empty,
+            b""
+        ));
+    }
+
+    #[test]
+    fn retry_delay_prefers_retry_after_then_backs_off() {
+        let mut h = HeaderMap::new();
+        h.insert("retry-after", "7".parse().expect("header"));
+        assert_eq!(retry_delay(&h, 0), std::time::Duration::from_secs(7));
+
+        // Retry-After is capped so a sync can't hang on a huge value.
+        let mut capped = HeaderMap::new();
+        capped.insert("retry-after", "9999".parse().expect("header"));
+        assert_eq!(retry_delay(&capped, 0), std::time::Duration::from_secs(60));
+
+        // Without any hint, exponential backoff: 1s, 2s, 4s...
+        assert_eq!(
+            retry_delay(&HeaderMap::new(), 0),
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(
+            retry_delay(&HeaderMap::new(), 1),
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(
+            retry_delay(&HeaderMap::new(), 2),
+            std::time::Duration::from_secs(4)
+        );
+    }
+
+    #[tokio::test]
+    async fn get_retries_after_rate_limit_then_succeeds() {
+        use axum::response::IntoResponse;
+        // The mock 403s with a rate-limit message once, then succeeds.
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/user",
+            get({
+                let calls = calls.clone();
+                move || {
+                    let calls = calls.clone();
+                    async move {
+                        let n = calls.fetch_add(1, Ordering::SeqCst);
+                        if n == 0 {
+                            return (
+                                StatusCode::FORBIDDEN,
+                                [("X-OAuth-Scopes", "repo")],
+                                r#"{"message":"You have exceeded a secondary rate limit"}"#,
+                            )
+                                .into_response();
+                        }
+                        (
+                            StatusCode::OK,
+                            [("X-OAuth-Scopes", "repo")],
+                            r#"{"login":"octocat"}"#,
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let base = format!("http://{addr}");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let client = Client::with_base(Arc::new(ClassicPat::new("ghp_x".into())), &base);
+        let v = client.validate().await.expect("validate");
+        assert!(v.ok, "the client should retry past the rate limit");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }
