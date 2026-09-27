@@ -40,6 +40,18 @@ pub struct SyncStatus {
     pub dismiss_running: bool,
     /// Count from the last completed manual dismiss pass.
     pub last_dismiss: Option<usize>,
+    /// Bumped whenever visible data changes mid-sync (after notifications, after
+    /// repos, after a dismiss), so the UI can repaint incrementally instead of
+    /// waiting for the whole pass to finish. Also bumped after any view-visible
+    /// mutation from the API handlers (bulk actions, config edits).
+    pub data_revision: u64,
+}
+
+/// Signal that view-visible data changed, so the UI should repaint. Safe to
+/// call from anywhere holding `AppState.sync_status`.
+pub fn bump_data_revision(status: &Arc<Mutex<SyncStatus>>) {
+    let mut s = status.lock().expect("sync status poisoned");
+    s.data_revision = s.data_revision.wrapping_add(1);
 }
 
 /// Background sync engine handle.
@@ -180,7 +192,13 @@ async fn sync_once(
 ) -> Result<String> {
     let now = now_utc();
 
+    // Phase ordering is deliberate: the phases that feed the visible Queue/Inbox
+    // (notifications, then repo issues/PRs) run first and bump `data_revision`
+    // as soon as they land, so the UI can repaint incrementally. The auxiliary
+    // phases (watches, per-repo subscription state, subject state) run after and
+    // are not required to render those views.
     sync_notifications(client, db, status).await?;
+    bump_data_revision(status);
 
     // Repo freshness is tracked per workspace: each workspace only fetches its
     // own repos, and it's refreshed when that workspace becomes active again.
@@ -194,7 +212,12 @@ async fn sync_once(
         }
     };
     if repo_due {
-        sync_repos(client, db, status, workspace, config).await?;
+        let repos = workspace.tracked_repos();
+        if !repos.is_empty() {
+            sync_repos(client, db, status, workspace, config).await?;
+            bump_data_revision(status);
+        }
+        // Auxiliary phases: none of these change what the Queue/Inbox render.
         sync_watches(client, db, status).await?;
         sync_repo_subscriptions(client, db, status, workspace, config).await?;
         refresh_subject_states(client, db, status, workspace, config).await?;
@@ -202,6 +225,7 @@ async fn sync_once(
     }
 
     maybe_auto_dismiss(client, db, config, workspace).await?;
+    bump_data_revision(status);
 
     db.set_sync_state("last_sync", &now)?;
     Ok(now)
@@ -940,6 +964,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bump_data_revision_increments() {
+        let status = Arc::new(Mutex::new(SyncStatus::default()));
+        assert_eq!(status.lock().expect("lock").data_revision, 0);
+        bump_data_revision(&status);
+        bump_data_revision(&status);
+        assert_eq!(status.lock().expect("lock").data_revision, 2);
+    }
+
+    #[test]
     fn parse_workflow_title_parses() {
         let (n, s, b) =
             parse_workflow_title("Renovate workflow run failed for main branch").expect("parse");
@@ -1219,6 +1252,11 @@ mod tests {
         sync_once(&client, &db, &config, &status, &config.workspaces[0], true)
             .await
             .expect("first sync");
+
+        // A completed pass bumps `data_revision` (after notifications, after
+        // repos, and after dismiss), so the UI repaints without waiting for
+        // `last_sync`.
+        assert!(status.lock().expect("lock").data_revision >= 2);
 
         let states: Vec<(String, String)> = db
             .list_repos(&crate::db::RepoFilter {

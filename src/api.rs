@@ -206,6 +206,8 @@ async fn state_handler(State(state): State<AppState>) -> Response {
 }
 
 async fn sync_handler(State(state): State<AppState>) -> Response {
+    // The sync itself bumps `data_revision` as phases complete; the UI repaints
+    // on those changes rather than waiting for the whole pass.
     let _ = state.sync_trigger.send(()).await;
     (
         StatusCode::ACCEPTED,
@@ -297,6 +299,9 @@ struct SyncStatusResponse {
     dismiss_running: bool,
     /// Count from the last completed manual dismiss pass.
     last_dismiss: Option<usize>,
+    /// Bumped whenever view-visible data changes. The UI repaints when this
+    /// changes, instead of waiting for `last_sync`.
+    data_revision: u64,
 }
 
 async fn sync_status_handler(State(state): State<AppState>) -> Response {
@@ -319,6 +324,7 @@ async fn sync_status_handler(State(state): State<AppState>) -> Response {
         rebuild: state.db.get_sync_state("last_rebuild").unwrap_or_default(),
         dismiss_running: status.dismiss_running,
         last_dismiss: status.last_dismiss,
+        data_revision: status.data_revision,
     };
     (
         [(header::CONTENT_TYPE, "application/json")],
@@ -354,6 +360,9 @@ async fn threads_mark_read(
         mark_threads_read(&state, &ids).await
     }
     .await;
+    if result.is_ok() {
+        crate::sync::bump_data_revision(&state.sync_status);
+    }
     json_response(result)
 }
 
@@ -378,6 +387,9 @@ async fn issues_mark_read(
         mark_threads_read(&state, &thread_ids).await
     }
     .await;
+    if result.is_ok() {
+        crate::sync::bump_data_revision(&state.sync_status);
+    }
     json_response(result)
 }
 
@@ -412,6 +424,9 @@ async fn threads_mute(
         Ok::<_, anyhow::Error>(count)
     }
     .await;
+    if result.is_ok() {
+        crate::sync::bump_data_revision(&state.sync_status);
+    }
     json_response(result)
 }
 
@@ -431,6 +446,9 @@ async fn repo_watch(
         Ok::<_, anyhow::Error>(())
     }
     .await;
+    if result.is_ok() {
+        crate::sync::bump_data_revision(&state.sync_status);
+    }
     json_response(result)
 }
 
@@ -452,6 +470,9 @@ async fn repo_unwatch(
         Ok::<_, anyhow::Error>(())
     }
     .await;
+    if result.is_ok() {
+        crate::sync::bump_data_revision(&state.sync_status);
+    }
     json_response(result)
 }
 
@@ -474,6 +495,9 @@ async fn repo_ignore(
         Ok::<_, anyhow::Error>(())
     }
     .await;
+    if result.is_ok() {
+        crate::sync::bump_data_revision(&state.sync_status);
+    }
     json_response(result)
 }
 
@@ -495,6 +519,9 @@ async fn repo_unignore(
         Ok::<_, anyhow::Error>(())
     }
     .await;
+    if result.is_ok() {
+        crate::sync::bump_data_revision(&state.sync_status);
+    }
     json_response(result)
 }
 
@@ -541,6 +568,9 @@ async fn repo_set_create(
         Ok::<_, anyhow::Error>(())
     }
     .await;
+    if result.is_ok() {
+        crate::sync::bump_data_revision(&state.sync_status);
+    }
     json_response(result)
 }
 
@@ -555,6 +585,9 @@ async fn repo_set_delete(
         Ok::<_, anyhow::Error>(())
     }
     .await;
+    if result.is_ok() {
+        crate::sync::bump_data_revision(&state.sync_status);
+    }
     json_response(result)
 }
 
@@ -569,6 +602,9 @@ async fn repo_delete(
         Ok::<_, anyhow::Error>(())
     }
     .await;
+    if result.is_ok() {
+        crate::sync::bump_data_revision(&state.sync_status);
+    }
     json_response(result)
 }
 
