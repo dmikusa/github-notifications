@@ -99,6 +99,10 @@ window.App.views = (() => {
 // initial sync is done, load the real view.
 let viewLoaded = false;
 let pollTimer = null;
+// The last data revision we rendered. When the server reports a newer one, the
+// visible view is repainted from cache even mid-sync, so the user sees fresh
+// rows as soon as a phase lands instead of waiting for the whole pass.
+let renderedRevision = null;
 
 function showLoading() {
   const el = document.getElementById('view');
@@ -115,8 +119,29 @@ async function onSyncStatus(status) {
   // spinner and "last sync" timestamp fresh.
   if (!viewLoaded && status.populated) {
     viewLoaded = true;
+    renderedRevision = status.data_revision;
     await window.App.views.load(window.App.state.currentView);
+    return;
   }
+  // Repaint whenever visible data changed, even while a sync is still running.
+  // Preserve the user's selection across the swap.
+  if (viewLoaded && status.data_revision !== renderedRevision) {
+    renderedRevision = status.data_revision;
+    const selected = window.App.table.selected ? window.App.table.selected() : [];
+    await window.App.views.reload();
+    restoreSelection(selected);
+  }
+}
+
+/// Re-check the checkboxes whose values were selected before a repaint, so a
+/// background repaint doesn't clear the user's multi-select.
+function restoreSelection(values) {
+  if (!values || !values.length) return;
+  const wanted = new Set(values);
+  document.querySelectorAll('#view .sel').forEach((cb) => {
+    if (wanted.has(cb.value)) cb.checked = true;
+  });
+  if (window.App.table.bind) window.App.table.bind();
 }
 
 async function syncStatusTick() {
@@ -232,8 +257,9 @@ async function refreshStatusLine() {
       setSyncRunning(true);
       window.App.flash.show('Syncing\u2026');
       try {
-        // A manual sync runs in the background; poll /api/sync/status until
-        // `last_sync` advances past the value at click time (or the pass fails).
+        // Kick off the sync and wait for it to finish. The continuous poller
+        // reloads the view incrementally (on data_revision changes) as phases
+        // land, so the table refreshes itself while this is still waiting.
         const before = (await window.App.api.getJSON('/api/sync/status')).last_sync;
         await window.App.api.postJSON('/api/sync', {});
         let outcome = { done: false, error: null };
@@ -247,7 +273,7 @@ async function refreshStatusLine() {
             outcome.error = st.last_error;
           }
         }
-        // Refresh the data table and the "last sync" line once it's done.
+        // One final repaint to be sure the table reflects the finished pass.
         await window.App.views.reload();
         const state = await refreshStatusLine();
         if (outcome.error) {

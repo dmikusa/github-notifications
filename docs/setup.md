@@ -91,6 +91,8 @@ Notes:
 | `github.oauth_client_id` | empty | OAuth app client ID (device flow) |
 | `github.poll_interval_seconds` | `300` | Notification poll interval |
 | `github.repo_refresh_interval_seconds` | `600` | Issue/PR refresh interval |
+| `github.sync_concurrency` | `6` | Concurrent GitHub requests per sync pass (1–10) |
+| `github.sync_dismiss_to_github` | `false` | Also sync closed/merged dismisses to GitHub (slower) |
 | `workspaces[].name` | — | Workspace display name |
 | `workspaces[].auto_dismiss_closed_merged` | `false` | Auto-mark closed+merged PR threads read |
 | `workspaces[].repo_sets[].name` | — | Repo set name |
@@ -107,6 +109,8 @@ auth_token = ""
 oauth_client_id = ""
 poll_interval_seconds = 300
 repo_refresh_interval_seconds = 600
+sync_concurrency = 6
+sync_dismiss_to_github = false
 
 [[workspaces]]
 name = "Personal"
