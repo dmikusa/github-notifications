@@ -76,7 +76,7 @@ fn default_repo_refresh_interval() -> u64 {
 
 /// How many GitHub API requests to make concurrently during a sync pass.
 fn default_sync_concurrency() -> u64 {
-    3
+    6
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -227,8 +227,8 @@ poll_interval_seconds = 300
 repo_refresh_interval_seconds = 600
 
 # How many GitHub API requests to make concurrently during a sync pass.
-# Must be between 1 and 10. Defaults to 3.
-sync_concurrency = 3
+# Must be between 1 and 10. Defaults to 6.
+sync_concurrency = 6
 
 # When clearing closed/merged notifications (the Inbox "Dismiss all
 # closed/merged" button, or a workspace's auto_dismiss_closed_merged), also
@@ -528,8 +528,8 @@ mod tests {
 
     #[test]
     fn sync_concurrency_defaults_and_clamps() {
-        assert_eq!(default_sync_concurrency(), 3);
-        assert_eq!(GithubConfig::default().effective_sync_concurrency(), 3);
+        assert_eq!(default_sync_concurrency(), 6);
+        assert_eq!(GithubConfig::default().effective_sync_concurrency(), 6);
 
         // Clamped to at least 1.
         let mut cfg = GithubConfig::default();

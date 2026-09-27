@@ -106,6 +106,21 @@ active workspace):
 
 Manual sync is available via `POST /api/sync`.
 
+**Incremental repaint.** A sync pass bumps a monotonic `data_revision` when
+view-visible data changes (after notifications, after repo issues/PRs, after a
+dismiss), and the phases are ordered so those land first; the auxiliary phases
+(watches, per-repo subscriptions, subject state) run after and are not required
+to render the Queue/Inbox. The UI polls `/api/sync/status` and repaints the
+current view whenever `data_revision` changes — even mid-sync — instead of
+waiting for the whole pass. So a refresh shows fresh rows in a couple of seconds
+rather than after the slowest phase. Only the current workspace's repos are
+fetched; an empty repo set means "no repos" (never "all").
+
+Concurrency defaults to 6 (configurable 1–10 via `github.sync_concurrency`),
+which measurably cuts the latency-bound repo/subscription phases. The GitHub
+client retries rate-limited responses (429, or 403 with a rate-limit hint)
+with backoff, honoring `Retry-After`.
+
 ### Data model
 
 Config (`config.toml`, gitignored):
@@ -117,6 +132,8 @@ auth_token = ""                 # PAT (or use GITHUB_TOKEN env)
 oauth_client_id = ""            # for oauth-device
 poll_interval_seconds = 300
 repo_refresh_interval_seconds = 600
+sync_concurrency = 6              # concurrent GitHub requests (1-10)
+sync_dismiss_to_github = false    # local-only closed/merged dismiss by default
 
 [[workspaces]]
 name = "personal"
