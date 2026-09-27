@@ -259,6 +259,11 @@ CREATE TABLE IF NOT EXISTS threads (
     subject_author TEXT
 );
 
+-- The queue joins each issue to its latest thread by (repo_id, subject_api_url);
+-- this index keeps that lookup from scanning every thread per row.
+CREATE INDEX IF NOT EXISTS idx_threads_repo_subject
+    ON threads (repo_id, subject_api_url);
+
 CREATE TABLE IF NOT EXISTS sync_state (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -520,6 +525,11 @@ CREATE TABLE IF NOT EXISTS org_repos (
     /// subject state for pull-request threads in the given repos, used by the
     /// "dismiss closed/merged" pass.
     pub fn get_pr_threads(&self, repos: &[String]) -> Result<Vec<PrThread>> {
+        // An empty repo list means "no repos", not "every repo". A workspace
+        // with no repo sets must dismiss nothing, not sweep the whole cache.
+        if repos.is_empty() {
+            return Ok(Vec::new());
+        }
         let conn = self.conn.lock().expect("db lock poisoned");
         let mut sql = String::from(
             "SELECT t.thread_id, t.api_url, t.subject_api_url, t.unread, t.subject_state
@@ -584,6 +594,12 @@ CREATE TABLE IF NOT EXISTS org_repos (
     /// re-verified; CheckSuite threads without a URL are resolved once from
     /// their title (skipped once `subject_state` is set).
     pub fn subject_threads_needing_refresh(&self, repos: &[String]) -> Result<Vec<SubjectThread>> {
+        // An empty repo list means "no repos", not "every repo". Without this,
+        // a workspace with no repo sets would refresh subject state for the
+        // entire thread cache (including repos it doesn't track).
+        if repos.is_empty() {
+            return Ok(Vec::new());
+        }
         let conn = self.conn.lock().expect("db lock poisoned");
         let mut sql = String::from(
             "SELECT t.thread_id, t.subject_type, t.subject_api_url, t.subject_check_url,
@@ -596,12 +612,14 @@ CREATE TABLE IF NOT EXISTS org_repos (
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if !repos.is_empty() {
-            let repo_clause = in_clause(repos.len());
+            let repo_clause = in_unnumbered(repos.len());
             sql.push_str(&format!(" AND r.full_name IN {repo_clause}"));
             for repo in repos {
                 params.push(Box::new(repo.clone()));
             }
         }
+        // The ORDER BY must come last, after any filter clauses are appended.
+        sql.push_str(" ORDER BY t.thread_id");
         let mut stmt = conn
             .prepare(&sql)
             .context("preparing subject refresh query")?;
@@ -1323,6 +1341,41 @@ mod tests {
     }
 
     #[test]
+    fn adds_queue_index_without_a_rebuild() {
+        use rusqlite::Connection;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("data.db");
+
+        // Simulate an existing (pre-index) database at the current version.
+        {
+            let conn = Connection::open(&path).expect("open raw");
+            conn.execute_batch(
+                "CREATE TABLE threads (id INTEGER PRIMARY KEY, thread_id TEXT UNIQUE, repo_id INTEGER, subject_api_url TEXT);
+                 PRAGMA user_version = 5;",
+            )
+            .expect("seed old schema");
+        }
+
+        let db = Database::open(&path).expect("open");
+        let conn = db.conn.lock().expect("lock");
+        let has_index: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_threads_repo_subject'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query index");
+        assert_eq!(has_index, 1, "the queue index should be created on open");
+        // The index is additive: opening an existing DB must not trigger the
+        // backup-and-rebuild path.
+        assert!(
+            !path.with_file_name("data.db.bak").exists(),
+            "adding the index must not force a cache rebuild"
+        );
+    }
+
+    #[test]
     fn fresh_and_matching_db_do_not_backup() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("data.db");
@@ -1559,6 +1612,54 @@ mod tests {
         db.delete_threads(&["1:pr".into(), "2:ci".into()])
             .expect("delete");
         assert_eq!(db.count("threads").expect("count"), 1);
+
+        // An empty repo list means "no repos", not "every repo": it must not
+        // return (or later refresh) the whole thread cache.
+        assert!(db
+            .subject_threads_needing_refresh(&[])
+            .expect("empty repos")
+            .is_empty());
+        assert!(db.get_pr_threads(&[]).expect("empty pr repos").is_empty());
+    }
+
+    #[test]
+    fn subject_refresh_only_includes_tracked_repos() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("open");
+        // A tracked repo and an untracked one, each with a PR thread.
+        for (full, n) in [("tracked/repo", 1u64), ("other/repo", 2)] {
+            db.upsert_repo(full, Some(&format!("https://github.com/{full}")))
+                .expect("repo");
+            let thread = crate::models::NotificationThread {
+                id: format!("{n}:pr"),
+                unread: true,
+                reason: "mention".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+                last_read_at: None,
+                subject: crate::models::ThreadSubject {
+                    title: "pr".into(),
+                    kind: "PullRequest".into(),
+                    url: Some(format!("https://api.github.com/repos/{full}/pulls/1")),
+                    latest_comment_url: None,
+                },
+                repository: Some(crate::models::ThreadRepository {
+                    full_name: full.into(),
+                    html_url: format!("https://github.com/{full}"),
+                }),
+                url: format!("https://api.github.com/notifications/threads/{n}"),
+            };
+            db.upsert_thread(&thread).expect("thread");
+        }
+
+        let needing = db
+            .subject_threads_needing_refresh(&["tracked/repo".into()])
+            .expect("list");
+        let ids: Vec<&str> = needing.iter().map(|t| t.thread_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["1:pr"],
+            "only threads for tracked repos should be refreshed"
+        );
     }
 
     #[test]
