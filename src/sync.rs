@@ -10,8 +10,8 @@ use crate::config::{Config, Workspace};
 use crate::db::Database;
 use crate::github::{self, next_link, Client, RateLimit};
 use crate::models::{
-    ActionsRuns, CheckRun, GithubIssue, GithubPullRequest, NotificationThread, RepoSubscription,
-    WatchedRepo,
+    ActionsRuns, CheckRun, DiscussionPage, GithubIssue, GithubPullRequest, NotificationThread,
+    RepoSubscription, SearchResults, WatchedRepo,
 };
 
 /// The workspace shown when the config has no workspaces yet.
@@ -225,6 +225,10 @@ async fn sync_once(
     }
 
     maybe_auto_dismiss(client, db, config, workspace).await?;
+    // The Summary tab's review-request and discussion data is global (not
+    // scoped to a workspace) and best-effort, so it runs last and never fails
+    // the pass.
+    sync_summary(client, db, status, config).await;
     bump_data_revision(status);
 
     db.set_sync_state("last_sync", &now)?;
@@ -820,6 +824,186 @@ async fn resolve_workflow_run(
     best.map(|(url, _)| url)
 }
 
+/// Search query for pull requests that still need the user's review. Addressed
+/// items drop out on the next search: it only returns open PRs that still
+/// request a review from the authenticated user.
+const REVIEW_REQUEST_SEARCH: &str = "is:open is:pr review-requested:@me";
+
+/// The Summary tab shows the most recent review requests only.
+const REVIEW_REQUEST_LIMIT: usize = 10;
+
+/// How many discussions to fetch per project (newest activity first).
+const DISCUSSION_PAGE_SIZE: usize = 50;
+
+const DISCUSSIONS_QUERY: &str = r#"
+query($owner: String!, $name: String!, $first: Int!) {
+  repository(owner: $owner, name: $name) {
+    discussions(first: $first, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes {
+        number
+        title
+        url
+        createdAt
+        updatedAt
+        author { login }
+        category { name }
+      }
+    }
+  }
+}
+"#;
+
+/// Refresh the Summary tab's global data: pull requests awaiting review and
+/// new discussions for the configured projects.
+///
+/// This is best-effort. A missing scope, an unreachable discussion, or a
+/// failed search must not break the Queue/Inbox sync, so errors are logged and
+/// the pass continues.
+async fn sync_summary(
+    client: &Client,
+    db: &Database,
+    status: &Arc<Mutex<SyncStatus>>,
+    config: &Config,
+) {
+    if let Err(e) = sync_review_requests(client, db, status).await {
+        tracing::warn!("review request sync failed: {e}");
+    }
+    if let Err(e) = sync_discussions(client, db, status, config).await {
+        tracing::warn!("discussions sync failed: {e}");
+    }
+}
+
+/// Cache the snapshot of pull requests awaiting review (`review-requested:@me`).
+async fn sync_review_requests(
+    client: &Client,
+    db: &Database,
+    status: &Arc<Mutex<SyncStatus>>,
+) -> Result<()> {
+    let response = client
+        .get(
+            "/search/issues",
+            &[
+                ("q", REVIEW_REQUEST_SEARCH),
+                ("sort", "updated"),
+                ("order", "desc"),
+                ("per_page", "10"),
+            ],
+            None,
+        )
+        .await?;
+    record_rate_limit(status, &response.headers);
+
+    if response.status != axum::http::StatusCode::OK {
+        // Search can be unavailable (e.g. a token without the needed access);
+        // leave the previous snapshot in place rather than clearing it.
+        tracing::warn!("review-request search returned {}", response.status);
+        return Ok(());
+    }
+
+    let results: SearchResults =
+        serde_json::from_slice(&response.body).context("parsing review request search")?;
+    let mut items: Vec<crate::db::ReviewRequestItem> = results
+        .items
+        .iter()
+        .filter_map(|item| {
+            let repo = item.repo_full_name()?;
+            Some(crate::db::ReviewRequestItem {
+                repo,
+                number: item.number as i64,
+                title: item.title.clone(),
+                author: item.user.as_ref().map(|u| u.login.clone()),
+                html_url: item.html_url.clone(),
+                created_at: non_empty(&item.created_at),
+                updated_at: non_empty(&item.updated_at),
+            })
+        })
+        .collect();
+    // Keep the ten most recently updated, even if the API ignores the sort.
+    items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    items.truncate(REVIEW_REQUEST_LIMIT);
+    db.replace_review_requests(&items)?;
+    Ok(())
+}
+
+/// Cache recent discussions for every configured project. Discussions are
+/// global config, independent of the active workspace's repo sets.
+async fn sync_discussions(
+    client: &Client,
+    db: &Database,
+    status: &Arc<Mutex<SyncStatus>>,
+    config: &Config,
+) -> Result<()> {
+    for full_name in &config.discussions.projects {
+        let Some((owner, name)) = full_name.split_once('/') else {
+            tracing::warn!("skipping discussion project {full_name}: expected owner/repo");
+            continue;
+        };
+        match fetch_discussions(client, status, owner, name).await {
+            Ok(nodes) => {
+                let items: Vec<crate::db::DiscussionItem> = nodes
+                    .iter()
+                    .map(|node| crate::db::DiscussionItem {
+                        repo: full_name.clone(),
+                        number: node.number as i64,
+                        title: node.title.clone(),
+                        url: node.url.clone(),
+                        author: node.author.as_ref().map(|a| a.login.clone()),
+                        category: node.category.as_ref().map(|c| c.name.clone()),
+                        created_at: non_empty(&node.created_at),
+                        updated_at: non_empty(&node.updated_at),
+                    })
+                    .collect();
+                db.replace_discussions(full_name, &items)?;
+            }
+            Err(e) => tracing::warn!("skipping discussions for {full_name}: {e}"),
+        }
+    }
+    Ok(())
+}
+
+/// Fetch one project's most recently updated discussions.
+async fn fetch_discussions(
+    client: &Client,
+    status: &Arc<Mutex<SyncStatus>>,
+    owner: &str,
+    name: &str,
+) -> Result<Vec<crate::models::DiscussionNode>> {
+    let response = client
+        .graphql(
+            DISCUSSIONS_QUERY,
+            serde_json::json!({ "owner": owner, "name": name, "first": DISCUSSION_PAGE_SIZE }),
+        )
+        .await?;
+    record_rate_limit(status, &response.headers);
+
+    if response.status != axum::http::StatusCode::OK {
+        anyhow::bail!("graphql endpoint returned {}", response.status);
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&response.body).context("parsing graphql response")?;
+    if let Some(errors) = value.get("errors") {
+        anyhow::bail!("graphql errors: {errors}");
+    }
+    let data = value
+        .get("data")
+        .cloned()
+        .context("graphql response has no data")?;
+    let page: DiscussionPage = serde_json::from_value(data).context("parsing discussion page")?;
+    let Some(repo) = page.repository else {
+        anyhow::bail!("repository not found or not accessible");
+    };
+    Ok(repo.discussions.nodes)
+}
+
+/// `Some` for a non-empty string, `None` otherwise.
+fn non_empty(value: &str) -> Option<String> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
 async fn maybe_auto_dismiss(
     client: &Client,
     db: &Database,
@@ -1125,6 +1309,7 @@ mod tests {
                 repo_refresh_interval_seconds: 60,
                 ..Default::default()
             },
+            discussions: Default::default(),
             workspaces: vec![crate::config::Workspace {
                 name: "test".into(),
                 auto_dismiss_closed_merged: true,
@@ -1234,6 +1419,7 @@ mod tests {
                 repo_refresh_interval_seconds: 60,
                 ..Default::default()
             },
+            discussions: Default::default(),
             workspaces: vec![crate::config::Workspace {
                 name: "test".into(),
                 auto_dismiss_closed_merged: false,
@@ -1323,6 +1509,7 @@ mod tests {
                 repo_refresh_interval_seconds: 60,
                 ..Default::default()
             },
+            discussions: Default::default(),
             workspaces: vec![crate::config::Workspace {
                 name: "test".into(),
                 auto_dismiss_closed_merged: false,
@@ -1391,6 +1578,7 @@ mod tests {
                 sync_concurrency: 10,
                 ..Default::default()
             },
+            discussions: Default::default(),
             workspaces: vec![crate::config::Workspace {
                 name: "test".into(),
                 auto_dismiss_closed_merged: false,
@@ -1478,6 +1666,7 @@ mod tests {
                 repo_refresh_interval_seconds: 60,
                 ..Default::default()
             },
+            discussions: Default::default(),
             workspaces: vec![
                 crate::config::Workspace {
                     name: "A".into(),
@@ -1614,6 +1803,7 @@ mod tests {
                 auth_token: "ghp_x".into(),
                 ..Default::default()
             },
+            discussions: Default::default(),
             workspaces: vec![crate::config::Workspace {
                 name: "test".into(),
                 auto_dismiss_closed_merged: false,
@@ -1713,6 +1903,7 @@ mod tests {
                 auth_token: "ghp_x".into(),
                 ..Default::default()
             },
+            discussions: Default::default(),
             workspaces: vec![crate::config::Workspace {
                 name: "test".into(),
                 auto_dismiss_closed_merged: false,
@@ -1931,6 +2122,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_summary_caches_review_requests_and_discussions() {
+        use axum::routing::{get, post};
+        use axum::Router;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+
+        // The mock returns 12 search hits; only the newest 10 are kept.
+        let search_body = format!(
+            r#"{{"items":[{}]}}"#,
+            (1..=12)
+                .map(|n| {
+                    format!(
+                        r#"{{"number":{n},"title":"pr {n}","html_url":"https://github.com/o/r/pull/{n}","updated_at":"2026-09-{n:02}T00:00:00Z","created_at":"2026-08-01T00:00:00Z","user":{{"login":"u"}},"repository_url":"https://api.github.com/repos/o/r"}}"#
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let discussion_updated = now_utc();
+        let graphql_body = serde_json::json!({
+            "data": {
+                "repository": {
+                    "discussions": {
+                        "nodes": [{
+                            "number": 4,
+                            "title": "a discussion",
+                            "url": "https://github.com/o/r/discussions/4",
+                            "createdAt": "2026-08-01T00:00:00Z",
+                            "updatedAt": discussion_updated,
+                            "author": {"login": "bob"},
+                            "category": {"name": "General"}
+                        }]
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let app = Router::new()
+            .route(
+                "/search/issues",
+                get(move || {
+                    let body = search_body.clone();
+                    async move { ([("ETag", "\"s1\"")], body) }
+                }),
+            )
+            .route(
+                "/graphql",
+                post(move || {
+                    let body = graphql_body.clone();
+                    async move { ([("ETag", "\"g1\"")], body) }
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("db");
+        let client = Client::with_base(
+            Arc::new(crate::auth::pat::ClassicPat::new("ghp_x".into())),
+            &base,
+        );
+        let status = Arc::new(Mutex::new(SyncStatus::default()));
+        let config = Config {
+            github: Default::default(),
+            discussions: crate::config::DiscussionsConfig {
+                projects: vec!["o/r".into()],
+                recent_days: 7,
+            },
+            workspaces: Vec::new(),
+        };
+
+        sync_review_requests(&client, &db, &status)
+            .await
+            .expect("review requests");
+        sync_discussions(&client, &db, &status, &config)
+            .await
+            .expect("discussions");
+
+        let reviews = db.list_review_requests(10).expect("reviews");
+        assert_eq!(reviews.len(), 10, "only the top 10 are kept");
+        assert_eq!(reviews[0].number, 12, "most recently updated first");
+
+        let discussions = db
+            .list_recent_discussions(&["o/r".into()], 7, 50)
+            .expect("discussions");
+        assert_eq!(discussions.len(), 1);
+        assert_eq!(discussions[0].repo, "o/r");
+        assert_eq!(discussions[0].title, "a discussion");
+        assert_eq!(discussions[0].author.as_deref(), Some("bob"));
+        assert_eq!(discussions[0].category.as_deref(), Some("General"));
+    }
+
+    #[tokio::test]
+    async fn sync_summary_survives_github_failures() {
+        use axum::Router;
+
+        // Every summary endpoint fails; the pass must not panic or error.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let app =
+            Router::new().fallback(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR });
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("db");
+        let client = Client::with_base(
+            Arc::new(crate::auth::pat::ClassicPat::new("ghp_x".into())),
+            &base,
+        );
+        let status = Arc::new(Mutex::new(SyncStatus::default()));
+        let config = Config {
+            github: Default::default(),
+            discussions: crate::config::DiscussionsConfig {
+                projects: vec!["o/r".into()],
+                recent_days: 7,
+            },
+            workspaces: Vec::new(),
+        };
+
+        sync_summary(&client, &db, &status, &config).await;
+        assert_eq!(db.count("review_requests").expect("reviews"), 0);
+        assert_eq!(db.count("discussions").expect("discussions"), 0);
+    }
+
+    #[tokio::test]
     async fn sync_notifications_skips_dismissed_subjects() {
         use axum::routing::get;
         use axum::Router;
@@ -1979,6 +2304,7 @@ mod tests {
                 repo_refresh_interval_seconds: 60,
                 ..Default::default()
             },
+            discussions: Default::default(),
             workspaces: vec![crate::config::Workspace {
                 name: "test".into(),
                 auto_dismiss_closed_merged: false,

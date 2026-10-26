@@ -79,6 +79,42 @@ fn default_sync_concurrency() -> u64 {
     6
 }
 
+/// GitHub Discussions projects shown on the Summary tab.
+///
+/// This is deliberately separate from workspace repo sets: the projects whose
+/// discussions you care about are usually a smaller, different list than the
+/// repos you triage notifications for.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscussionsConfig {
+    /// Explicit `owner/repo` projects to read discussions from.
+    #[serde(default)]
+    pub projects: Vec<String>,
+    /// Only show discussions updated within this many days.
+    #[serde(default = "default_discussion_recent_days")]
+    pub recent_days: u64,
+}
+
+impl DiscussionsConfig {
+    /// The recent window clamped to at least one day.
+    pub fn effective_recent_days(&self) -> u64 {
+        self.recent_days.max(1)
+    }
+}
+
+impl Default for DiscussionsConfig {
+    fn default() -> Self {
+        Self {
+            projects: Vec::new(),
+            recent_days: default_discussion_recent_days(),
+        }
+    }
+}
+
+fn default_discussion_recent_days() -> u64 {
+    7
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Workspace {
@@ -124,6 +160,10 @@ pub struct RepoSet {
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub github: GithubConfig,
+    /// Discussions projects shown on the Summary tab (independent of
+    /// workspaces).
+    #[serde(default)]
+    pub discussions: DiscussionsConfig,
     #[serde(default)]
     pub workspaces: Vec<Workspace>,
 }
@@ -236,6 +276,18 @@ sync_concurrency = 6
 # threads read there. Off by default, so clearing stays local and fast and
 # uses the PR state already cached from sync.
 sync_dismiss_to_github = false
+
+# GitHub Discussions projects shown on the Summary tab. This list is separate
+# from workspace repo sets on purpose: the projects whose discussions you
+# follow are often different from the repos you triage notifications for.
+# Discussions only ever appear on the Summary tab.
+#
+# recent_days controls how far back a discussion can be updated and still show
+# up. Defaults to 7 days.
+#
+# [discussions]
+# projects = ["org1/repo-a"]
+# recent_days = 7
 
 # Workspaces group repos and saved filters into separate views (e.g. personal
 # vs work). Each workspace has one or more repo sets: explicit lists of repos
@@ -500,6 +552,10 @@ mod tests {
                 sync_concurrency: 5,
                 sync_dismiss_to_github: true,
             },
+            discussions: DiscussionsConfig {
+                projects: vec!["org1/repo-a".into()],
+                recent_days: 14,
+            },
             workspaces: vec![Workspace {
                 name: "personal".into(),
                 auto_dismiss_closed_merged: true,
@@ -518,6 +574,8 @@ mod tests {
         assert_eq!(parsed.github.repo_refresh_interval_seconds, 120);
         assert_eq!(parsed.github.sync_concurrency, 5);
         assert!(parsed.github.sync_dismiss_to_github);
+        assert_eq!(parsed.discussions.projects, vec!["org1/repo-a".to_string()]);
+        assert_eq!(parsed.discussions.recent_days, 14);
         assert_eq!(parsed.workspaces[0].name, "personal");
         assert!(parsed.workspaces[0].auto_dismiss_closed_merged);
         assert_eq!(
@@ -572,6 +630,22 @@ mod tests {
         assert_eq!(config.github.auth_provider, AuthProvider::Pat);
         assert_eq!(config.github.poll_interval_seconds, 300);
         assert!(config.workspaces.is_empty());
+        assert!(config.discussions.projects.is_empty());
+        assert_eq!(config.discussions.recent_days, 7);
+    }
+
+    #[test]
+    fn discussions_default_to_a_week_and_clamp() {
+        let config: Config = toml::from_str("[github]\n").expect("parse");
+        assert_eq!(config.discussions.projects, Vec::<String>::new());
+        assert_eq!(config.discussions.recent_days, 7);
+        assert_eq!(config.discussions.effective_recent_days(), 7);
+
+        let config: Config =
+            toml::from_str("[github]\n[discussions]\nprojects = [\"a/r\"]\nrecent_days = 0\n")
+                .expect("parse");
+        assert_eq!(config.discussions.projects, vec!["a/r".to_string()]);
+        assert_eq!(config.discussions.effective_recent_days(), 1);
     }
 
     #[cfg(unix)]

@@ -107,6 +107,82 @@ pub struct WatchedRepo {
     pub html_url: String,
 }
 
+/// A page of issue/PR search results (`GET /search/issues`), used to find pull
+/// requests awaiting review.
+#[derive(Debug, Deserialize)]
+pub struct SearchResults {
+    #[serde(default)]
+    pub items: Vec<SearchItem>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SearchItem {
+    pub number: u64,
+    pub title: String,
+    pub html_url: String,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub user: Option<GithubUser>,
+    /// API URL of the owning repository, e.g.
+    /// `https://api.github.com/repos/o/r`.
+    #[serde(default)]
+    pub repository_url: String,
+}
+
+impl SearchItem {
+    /// The `owner/repo` full name derived from `repository_url`.
+    pub fn repo_full_name(&self) -> Option<String> {
+        let rest = self.repository_url.split("/repos/").nth(1)?;
+        let mut parts = rest.split('/');
+        let owner = parts.next().filter(|s| !s.is_empty())?;
+        let name = parts.next().filter(|s| !s.is_empty())?;
+        Some(format!("{owner}/{name}"))
+    }
+}
+
+/// The `data` shape of a GraphQL discussions query.
+#[derive(Debug, Deserialize)]
+pub struct DiscussionPage {
+    #[serde(default)]
+    pub repository: Option<DiscussionRepository>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DiscussionRepository {
+    #[serde(default)]
+    pub discussions: DiscussionConnection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct DiscussionConnection {
+    #[serde(default)]
+    pub nodes: Vec<DiscussionNode>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussionNode {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
+    pub author: Option<GithubUser>,
+    #[serde(default)]
+    pub category: Option<DiscussionCategory>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DiscussionCategory {
+    pub name: String,
+}
+
 /// The authenticated user's subscription for a repository
 /// (`GET /repos/{owner}/{repo}/subscription`).
 #[derive(Debug, Deserialize)]
@@ -167,5 +243,54 @@ mod tests {
                 .expect("pr");
         assert_eq!(pr.state, "closed");
         assert!(pr.merged_at.is_some());
+    }
+
+    #[test]
+    fn parses_search_results_and_repo_name() {
+        let results: SearchResults = serde_json::from_str(
+            r#"{"items":[{
+                "number": 7,
+                "title": "a pr",
+                "html_url": "https://github.com/o/r/pull/7",
+                "updated_at": "2026-09-03T12:00:00Z",
+                "created_at": "2026-09-01T12:00:00Z",
+                "user": {"login": "alice"},
+                "repository_url": "https://api.github.com/repos/o/r"
+            }]}"#,
+        )
+        .expect("search results");
+        assert_eq!(results.items.len(), 1);
+        assert_eq!(results.items[0].repo_full_name().as_deref(), Some("o/r"));
+        assert_eq!(
+            results.items[0].user.as_ref().map(|u| u.login.as_str()),
+            Some("alice")
+        );
+    }
+
+    #[test]
+    fn parses_discussion_nodes() {
+        let page: DiscussionPage = serde_json::from_str(
+            r#"{"repository":{"discussions":{"nodes":[{
+                "number": 4,
+                "title": "a discussion",
+                "url": "https://github.com/o/r/discussions/4",
+                "createdAt": "2026-09-01T00:00:00Z",
+                "updatedAt": "2026-09-03T00:00:00Z",
+                "author": {"login": "bob"},
+                "category": {"name": "General"}
+            }]}}}"#,
+        )
+        .expect("discussion page");
+        let nodes = page.repository.expect("repository").discussions.nodes;
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].number, 4);
+        assert_eq!(
+            nodes[0].category.as_ref().map(|c| c.name.as_str()),
+            Some("General")
+        );
+        assert_eq!(
+            nodes[0].author.as_ref().map(|a| a.login.as_str()),
+            Some("bob")
+        );
     }
 }

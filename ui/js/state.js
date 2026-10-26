@@ -4,7 +4,7 @@ window.App = window.App || {};
 window.App.state = {
   workspaces: [],
   currentWorkspace: '',
-  currentView: 'queue',
+  currentView: 'summary',
 
   setWorkspaces(names) {
     this.workspaces = names.slice();

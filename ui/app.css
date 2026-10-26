@@ -388,6 +388,39 @@ button.primary {
   margin: 0.25rem 0 0.75rem;
 }
 
+.summary-section {
+  margin-bottom: 1.5rem;
+}
+
+.summary-section:last-child {
+  margin-bottom: 0;
+}
+
+.section-title {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+}
+
+.section-count {
+  display: inline-block;
+  padding: 0.05rem 0.45rem;
+  border-radius: 999px;
+  background: #eaeef2;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.section-hint {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+
 .card {
   background: var(--panel);
   border: 1px solid var(--border);

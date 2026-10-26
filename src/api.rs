@@ -50,6 +50,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sync", post(sync_handler))
         .route("/api/sync/status", get(sync_status_handler))
         .route("/api/views/queue", get(queue_view))
+        .route("/api/views/summary", get(summary_view))
         .route("/api/views/inbox", get(inbox_view))
         .route("/api/views/repos", get(repos_view))
         .route("/api/views/settings", get(settings_view))
@@ -245,6 +246,18 @@ async fn queue_view(
     let config = state.config.read().expect("config lock poisoned");
     let ws = views::resolve_workspace(&config, &params.ws);
     match views::render_queue(&state.db, ws, &params) {
+        Ok(html) => html_response(html),
+        Err(e) => json_response(Err::<(), _>(e)),
+    }
+}
+
+async fn summary_view(
+    State(state): State<AppState>,
+    Query(params): Query<views::SummaryParams>,
+) -> Response {
+    let config = state.config.read().expect("config lock poisoned");
+    let ws = views::resolve_workspace(&config, &params.ws);
+    match views::render_summary(&state.db, ws, &config) {
         Ok(html) => html_response(html),
         Err(e) => json_response(Err::<(), _>(e)),
     }
@@ -895,6 +908,7 @@ mod tests {
                 auth_token: "ghp_test".into(),
                 ..Default::default()
             },
+            discussions: Default::default(),
             workspaces: vec![Workspace {
                 name: "personal".into(),
                 auto_dismiss_closed_merged: false,
@@ -1010,6 +1024,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn summary_view_renders_all_sections() {
+        let app = router(test_state());
+        let (status, body) = get_body(app, "/api/views/summary?ws=personal").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Mentions"));
+        assert!(body.contains("CI failures"));
+        assert!(body.contains("Discussions"));
+        assert!(body.contains("Review requests"));
+        assert!(body.contains(r#"data-view="summary""#));
+    }
+
+    #[tokio::test]
     async fn inbox_view_renders_filter_form() {
         let app = router(test_state());
         let (status, body) = get_body(app, "/api/views/inbox?ws=personal&unread=true").await;
@@ -1027,6 +1053,7 @@ mod tests {
                 auth_token: "ghp_test".into(),
                 ..Default::default()
             },
+            discussions: Default::default(),
             workspaces: vec![Workspace {
                 name: "personal".into(),
                 auto_dismiss_closed_merged: false,

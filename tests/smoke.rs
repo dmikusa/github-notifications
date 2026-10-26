@@ -35,6 +35,7 @@ async fn online_live_sync_polls_github() {
             auth_provider: AuthProvider::Pat,
             ..Default::default()
         },
+        discussions: Default::default(),
         workspaces: vec![Workspace {
             name: "smoke".into(),
             auto_dismiss_closed_merged: false,

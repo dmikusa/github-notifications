@@ -93,6 +93,8 @@ Notes:
 | `github.repo_refresh_interval_seconds` | `600` | Issue/PR refresh interval |
 | `github.sync_concurrency` | `6` | Concurrent GitHub requests per sync pass (1–10) |
 | `github.sync_dismiss_to_github` | `false` | Also sync closed/merged dismisses to GitHub (slower) |
+| `discussions.projects` | `[]` | Explicit `owner/repo` projects whose Discussions appear on the Summary tab |
+| `discussions.recent_days` | `7` | Show discussions updated within this many days |
 | `workspaces[].name` | — | Workspace display name |
 | `workspaces[].auto_dismiss_closed_merged` | `false` | Auto-mark closed+merged PR threads read |
 | `workspaces[].repo_sets[].name` | — | Repo set name |
@@ -111,6 +113,12 @@ poll_interval_seconds = 300
 repo_refresh_interval_seconds = 600
 sync_concurrency = 6
 sync_dismiss_to_github = false
+
+# Optional: projects whose Discussions show up on the Summary tab. This list
+# is independent of workspace repo sets.
+[discussions]
+projects = ["org1/repo-a"]
+recent_days = 7
 
 [[workspaces]]
 name = "Personal"

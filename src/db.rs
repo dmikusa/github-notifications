@@ -144,9 +144,56 @@ pub struct RepoFilter<'a> {
     pub search: Option<&'a str>,
 }
 
+/// One row of the Summary tab's mention and CI-failure lists (a notification
+/// thread joined to its repo).
+#[derive(Debug, Clone)]
+pub struct SummaryThread {
+    pub thread_id: String,
+    pub repo: String,
+    pub subject_type: String,
+    /// The PR/issue number, when the subject is one.
+    pub number: Option<String>,
+    pub title: String,
+    pub author: Option<String>,
+    /// The latest notification activity for the thread.
+    pub updated_at: String,
+    /// The subject's GitHub page (preferring its resolved state URL).
+    pub html_url: Option<String>,
+    /// PR open/closed/merged, or a check run conclusion.
+    pub state: Option<String>,
+}
+
+/// One Discussion row shown on the Summary tab.
+#[derive(Debug, Clone)]
+pub struct DiscussionItem {
+    pub repo: String,
+    pub number: i64,
+    pub title: String,
+    pub url: String,
+    pub author: Option<String>,
+    pub category: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+/// One pull request awaiting review (`review-requested:@me` search result).
+#[derive(Debug, Clone)]
+pub struct ReviewRequestItem {
+    pub repo: String,
+    pub number: i64,
+    pub title: String,
+    pub author: Option<String>,
+    pub html_url: String,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+/// Check-run conclusions that count as a CI failure worth surfacing.
+pub const CI_FAILURE_STATES: &[&str] = &["failure", "timed_out", "startup_failure"];
+
 /// Current schema version. Bump whenever the SQLite schema changes; the
 /// database is rebuilt (backed up and recreated) on mismatch.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 impl Database {
     /// Open (creating if needed) the database at `path` and initialize the
@@ -274,6 +321,34 @@ CREATE TABLE IF NOT EXISTS org_repos (
     full_name TEXT NOT NULL,
     html_url  TEXT,
     PRIMARY KEY (org, full_name)
+);
+
+CREATE TABLE IF NOT EXISTS discussions (
+    id         INTEGER PRIMARY KEY,
+    repo       TEXT NOT NULL,
+    number     INTEGER NOT NULL,
+    title      TEXT NOT NULL,
+    url        TEXT NOT NULL,
+    author     TEXT,
+    category   TEXT,
+    created_at TEXT,
+    updated_at TEXT,
+    UNIQUE (repo, number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_discussions_updated
+    ON discussions (updated_at);
+
+CREATE TABLE IF NOT EXISTS review_requests (
+    id         INTEGER PRIMARY KEY,
+    repo       TEXT NOT NULL,
+    number     INTEGER NOT NULL,
+    title      TEXT NOT NULL,
+    author     TEXT,
+    html_url   TEXT NOT NULL,
+    created_at TEXT,
+    updated_at TEXT,
+    UNIQUE (repo, number)
 );
 "#,
         )
@@ -992,6 +1067,219 @@ CREATE TABLE IF NOT EXISTS org_repos (
         Ok(out)
     }
 
+    /// Unread notification threads where someone mentioned the user directly
+    /// (`reason = "mention"`). Team mentions (`team_mention`) and review
+    /// requests (`review_requested`) are deliberately excluded.
+    pub fn list_mentions(&self, repos: &[String], limit: usize) -> Result<Vec<SummaryThread>> {
+        self.list_summary_threads(
+            repos,
+            "t.reason = 'mention' AND t.unread = 1",
+            Vec::new(),
+            limit,
+        )
+    }
+
+    /// Unread notification threads whose CI check failed and hasn't been
+    /// addressed (read/dismissed) yet.
+    pub fn list_ci_failures(&self, repos: &[String], limit: usize) -> Result<Vec<SummaryThread>> {
+        let states = CI_FAILURE_STATES
+            .iter()
+            .map(|s| format!("'{s}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let where_clause = format!(
+            "t.subject_type IN ('CheckSuite', 'WorkflowRun')
+             AND t.unread = 1
+             AND t.subject_state IN ({states})"
+        );
+        self.list_summary_threads(repos, &where_clause, Vec::new(), limit)
+    }
+
+    /// Shared query for the Summary tab's thread sections.
+    fn list_summary_threads(
+        &self,
+        repos: &[String],
+        where_clause: &str,
+        mut extra_params: Vec<Box<dyn rusqlite::ToSql>>,
+        limit: usize,
+    ) -> Result<Vec<SummaryThread>> {
+        // An empty repo list means "no repos", not "every repo".
+        if repos.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let mut sql = String::from(
+            "SELECT t.thread_id, r.full_name, t.subject_type, t.subject_title,
+                    t.updated_at, t.subject_api_url, t.subject_state_html_url,
+                    t.subject_author, t.subject_state
+             FROM threads t JOIN repos r ON r.id = t.repo_id
+             WHERE ",
+        );
+        sql.push_str(where_clause);
+        let repo_clause = in_unnumbered(repos.len());
+        sql.push_str(&format!(
+            " AND r.full_name IN {repo_clause}
+              ORDER BY t.updated_at DESC LIMIT ?"
+        ));
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        params.append(&mut extra_params);
+        for repo in repos {
+            params.push(Box::new(repo.clone()));
+        }
+        params.push(Box::new(limit as i64));
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .context("preparing summary thread query")?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(params.iter()),
+                summary_thread_row,
+            )
+            .context("querying summary threads")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("reading summary threads")
+    }
+
+    /// Replace the cached discussions for one repo with a fresh GraphQL page.
+    pub fn replace_discussions(&self, repo: &str, items: &[DiscussionItem]) -> Result<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let tx = conn
+            .unchecked_transaction()
+            .context("starting discussion replace")?;
+        tx.execute("DELETE FROM discussions WHERE repo = ?1", params![repo])
+            .context("clearing discussions")?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT OR REPLACE INTO discussions
+                       (repo, number, title, url, author, category, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                )
+                .context("preparing discussion insert")?;
+            for item in items {
+                stmt.execute(params![
+                    repo,
+                    item.number,
+                    item.title,
+                    item.url,
+                    item.author,
+                    item.category,
+                    item.created_at,
+                    item.updated_at,
+                ])
+                .context("inserting discussion")?;
+            }
+        }
+        tx.commit().context("committing discussions")
+    }
+
+    /// Discussions for `projects` updated within the last `recent_days`, newest
+    /// activity first. Rows cached for projects no longer configured are
+    /// ignored.
+    pub fn list_recent_discussions(
+        &self,
+        projects: &[String],
+        recent_days: u64,
+        limit: usize,
+    ) -> Result<Vec<DiscussionItem>> {
+        if projects.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(recent_days.max(1) as i64))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let repo_clause = in_unnumbered(projects.len());
+        let sql = format!(
+            "SELECT repo, number, title, url, author, category, created_at, updated_at
+             FROM discussions
+             WHERE datetime(updated_at) >= datetime(?) AND repo IN {repo_clause}
+             ORDER BY datetime(updated_at) DESC LIMIT ?"
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(cutoff)];
+        for project in projects {
+            params.push(Box::new(project.clone()));
+        }
+        params.push(Box::new(limit as i64));
+
+        let mut stmt = conn.prepare(&sql).context("preparing recent discussions")?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok(DiscussionItem {
+                    repo: row.get(0)?,
+                    number: row.get(1)?,
+                    title: row.get(2)?,
+                    url: row.get(3)?,
+                    author: row.get(4)?,
+                    category: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                })
+            })
+            .context("querying recent discussions")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("reading recent discussions")
+    }
+
+    /// Replace the cached "pull requests awaiting my review" snapshot.
+    pub fn replace_review_requests(&self, items: &[ReviewRequestItem]) -> Result<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let tx = conn
+            .unchecked_transaction()
+            .context("starting review request replace")?;
+        tx.execute("DELETE FROM review_requests", [])
+            .context("clearing review requests")?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT OR REPLACE INTO review_requests
+                       (repo, number, title, author, html_url, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .context("preparing review request insert")?;
+            for item in items {
+                stmt.execute(params![
+                    item.repo,
+                    item.number,
+                    item.title,
+                    item.author,
+                    item.html_url,
+                    item.created_at,
+                    item.updated_at,
+                ])
+                .context("inserting review request")?;
+            }
+        }
+        tx.commit().context("committing review requests")
+    }
+
+    /// Pull requests awaiting review, most recently updated first.
+    pub fn list_review_requests(&self, limit: usize) -> Result<Vec<ReviewRequestItem>> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT repo, number, title, author, html_url, created_at, updated_at
+                 FROM review_requests
+                 ORDER BY datetime(updated_at) DESC, number DESC LIMIT ?1",
+            )
+            .context("preparing review requests")?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok(ReviewRequestItem {
+                    repo: row.get(0)?,
+                    number: row.get(1)?,
+                    title: row.get(2)?,
+                    author: row.get(3)?,
+                    html_url: row.get(4)?,
+                    created_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            })
+            .context("querying review requests")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("reading review requests")
+    }
+
     /// List repos that are watched or tracked by the workspace.
     pub fn list_repos(&self, f: &RepoFilter) -> Result<Vec<RepoItem>> {
         let conn = self.conn.lock().expect("db lock poisoned");
@@ -1288,6 +1576,27 @@ fn subject_number(api: Option<&str>) -> Option<String> {
     id.parse::<i64>().ok().map(|_| id.to_string())
 }
 
+/// Map a Summary-tab thread query row (see `list_summary_threads`) to a
+/// [`SummaryThread`], preferring the resolved subject-state page as the link.
+fn summary_thread_row(row: &rusqlite::Row) -> rusqlite::Result<SummaryThread> {
+    let subject_api_url: Option<String> = row.get(5)?;
+    let state_html_url: Option<String> = row.get(6)?;
+    let html_url = state_html_url.or_else(|| subject_html_url(subject_api_url.as_deref()));
+    Ok(SummaryThread {
+        thread_id: row.get(0)?,
+        repo: row.get(1)?,
+        subject_type: row.get(2)?,
+        title: row.get(3)?,
+        updated_at: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+        number: subject_number(subject_api_url.as_deref()),
+        author: row.get(7)?,
+        state: row
+            .get::<_, Option<String>>(8)?
+            .filter(|s| s != "unresolved"),
+        html_url,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1332,7 +1641,14 @@ mod tests {
             .expect("query")
             .collect::<rusqlite::Result<_>>()
             .expect("collect");
-        for expected in ["repos", "issues", "threads", "sync_state"] {
+        for expected in [
+            "repos",
+            "issues",
+            "threads",
+            "sync_state",
+            "discussions",
+            "review_requests",
+        ] {
             assert!(
                 tables.iter().any(|t| t == expected),
                 "missing table {expected}"
@@ -1351,7 +1667,7 @@ mod tests {
             let conn = Connection::open(&path).expect("open raw");
             conn.execute_batch(
                 "CREATE TABLE threads (id INTEGER PRIMARY KEY, thread_id TEXT UNIQUE, repo_id INTEGER, subject_api_url TEXT);
-                 PRAGMA user_version = 5;",
+                 PRAGMA user_version = 6;",
             )
             .expect("seed old schema");
         }
@@ -1824,6 +2140,197 @@ mod tests {
             assert_eq!(queue[0].activity_at, "2025-06-01T00:00:00Z");
             assert_eq!(queue[1].activity_at, "2021-12-08T16:22:53Z");
         }
+    }
+
+    fn notification_thread(
+        id: &str,
+        kind: &str,
+        reason: &str,
+        unread: bool,
+        repo: &str,
+        subject_url: Option<&str>,
+    ) -> crate::models::NotificationThread {
+        crate::models::NotificationThread {
+            id: id.into(),
+            unread,
+            reason: reason.into(),
+            updated_at: "2026-09-03T12:00:00Z".into(),
+            last_read_at: None,
+            subject: crate::models::ThreadSubject {
+                title: format!("subject {id}"),
+                kind: kind.into(),
+                url: subject_url.map(str::to_string),
+                latest_comment_url: None,
+            },
+            repository: Some(crate::models::ThreadRepository {
+                full_name: repo.into(),
+                html_url: format!("https://github.com/{repo}"),
+            }),
+            url: format!("https://api.github.com/notifications/threads/{id}"),
+        }
+    }
+
+    #[test]
+    fn summary_mentions_exclude_team_reviews_and_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("open");
+        db.upsert_repo("o/r", Some("https://github.com/o/r"))
+            .expect("repo");
+        // A direct mention: shown.
+        db.upsert_thread(&notification_thread(
+            "1:mention",
+            "Issue",
+            "mention",
+            true,
+            "o/r",
+            Some("https://api.github.com/repos/o/r/issues/1"),
+        ))
+        .expect("mention");
+        // Team mentions, review requests, and read threads: hidden.
+        for (id, reason, unread) in [
+            ("2:team", "team_mention", true),
+            ("3:review", "review_requested", true),
+            ("4:read", "mention", false),
+        ] {
+            let thread = notification_thread(
+                id,
+                "Issue",
+                reason,
+                unread,
+                "o/r",
+                Some("https://api.github.com/repos/o/r/issues/2"),
+            );
+            db.upsert_thread(&thread).expect("thread");
+        }
+        // A mention in a repo outside the workspace: hidden.
+        let other = notification_thread(
+            "5:other",
+            "Issue",
+            "mention",
+            true,
+            "other/r",
+            Some("https://api.github.com/repos/other/r/issues/5"),
+        );
+        db.upsert_thread(&other).expect("other");
+
+        let mentions = db.list_mentions(&["o/r".into()], 50).expect("mentions");
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].thread_id, "1:mention");
+        assert_eq!(mentions[0].repo, "o/r");
+        assert_eq!(mentions[0].number.as_deref(), Some("1"));
+        assert_eq!(
+            mentions[0].html_url.as_deref(),
+            Some("https://github.com/o/r/issues/1")
+        );
+
+        // No repos means no rows, never the whole cache.
+        assert!(db.list_mentions(&[], 50).expect("empty repos").is_empty());
+    }
+
+    #[test]
+    fn summary_ci_failures_only_include_unread_failures() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("open");
+        for (id, state, unread) in [
+            ("1:failure", "failure", true),
+            ("2:success", "success", true),
+            ("3:timeout", "timed_out", true),
+            ("4:read", "failure", false),
+        ] {
+            let thread = notification_thread(id, "CheckSuite", "ci_activity", unread, "o/r", None);
+            db.upsert_thread(&thread).expect("thread");
+            db.set_subject_state(id, state, None, None, "2026-09-03T13:00:00Z")
+                .expect("state");
+        }
+
+        let failures = db.list_ci_failures(&["o/r".into()], 50).expect("failures");
+        let ids: Vec<&str> = failures.iter().map(|f| f.thread_id.as_str()).collect();
+        assert_eq!(ids, vec!["1:failure", "3:timeout"]);
+        assert_eq!(failures[0].state.as_deref(), Some("failure"));
+    }
+
+    #[test]
+    fn discussions_are_replaced_and_filtered_by_recency() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("open");
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let old = (chrono::Utc::now() - chrono::Duration::days(30))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let discussion = |number: i64, updated: &str| DiscussionItem {
+            repo: "o/r".into(),
+            number,
+            title: format!("discussion {number}"),
+            url: format!("https://github.com/o/r/discussions/{number}"),
+            author: Some("alice".into()),
+            category: Some("General".into()),
+            created_at: Some(old.clone()),
+            updated_at: Some(updated.to_string()),
+        };
+        db.replace_discussions("o/r", &[discussion(1, &now), discussion(2, &old)])
+            .expect("replace");
+
+        let recent = db
+            .list_recent_discussions(&["o/r".into()], 7, 50)
+            .expect("recent");
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].number, 1);
+
+        // A wider window includes the old one.
+        let wider = db
+            .list_recent_discussions(&["o/r".into()], 60, 50)
+            .expect("wider");
+        assert_eq!(wider.len(), 2);
+
+        // Only configured projects are shown; no projects means no rows.
+        assert!(db
+            .list_recent_discussions(&["other/repo".into()], 60, 50)
+            .expect("other project")
+            .is_empty());
+        assert!(db
+            .list_recent_discussions(&[], 60, 50)
+            .expect("no projects")
+            .is_empty());
+
+        // Replacing a repo drops its old rows.
+        db.replace_discussions("o/r", &[discussion(3, &now)])
+            .expect("replace again");
+        let recent = db
+            .list_recent_discussions(&["o/r".into()], 60, 50)
+            .expect("recent");
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].number, 3);
+    }
+
+    #[test]
+    fn review_requests_are_replaced_and_ordered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("open");
+        let request = |number: i64, updated: &str| ReviewRequestItem {
+            repo: "o/r".into(),
+            number,
+            title: format!("pr {number}"),
+            author: Some("bob".into()),
+            html_url: format!("https://github.com/o/r/pull/{number}"),
+            created_at: Some("2026-08-01T00:00:00Z".into()),
+            updated_at: Some(updated.to_string()),
+        };
+        db.replace_review_requests(&[
+            request(1, "2026-09-01T00:00:00Z"),
+            request(2, "2026-09-03T00:00:00Z"),
+        ])
+        .expect("replace");
+        let reviews = db.list_review_requests(10).expect("reviews");
+        assert_eq!(
+            reviews.iter().map(|r| r.number).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+
+        // A fresh snapshot clears addressed reviews.
+        db.replace_review_requests(&[request(2, "2026-09-03T00:00:00Z")])
+            .expect("replace again");
+        let reviews = db.list_review_requests(10).expect("reviews");
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].number, 2);
     }
 
     #[test]
