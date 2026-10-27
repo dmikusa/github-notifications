@@ -80,7 +80,23 @@ pub fn router(state: AppState) -> Router {
         )
         .fallback(static_handler)
         .layer(axum::middleware::from_fn(log_requests))
+        .layer(axum::middleware::from_fn(no_store_api))
         .with_state(state)
+}
+
+/// Mark `/api/*` responses as uncacheable. Without this, a browser can serve a
+/// stale sync status (e.g. `running: true`) and leave the UI spinner stuck even
+/// after the pass has finished. Static assets are left cacheable.
+async fn no_store_api(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let is_api = request.uri().path().starts_with("/api/");
+    let mut response = next.run(request).await;
+    if is_api {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    }
+    response
 }
 
 /// Debug-level access log for incoming HTTP requests: method, path, status,
@@ -323,16 +339,14 @@ async fn sync_status_handler(State(state): State<AppState>) -> Response {
         .lock()
         .expect("sync status poisoned")
         .clone();
-    let populated = status.last_sync.is_some()
-        || state
-            .db
-            .get_sync_state("last_sync")
-            .map(|v| v.is_some())
-            .unwrap_or(false);
+    // Fall back to the stored timestamp while the first pass after a daemon
+    // restart is still running, so the UI can keep showing the last sync time.
+    let last_sync_db = state.db.get_sync_state("last_sync").unwrap_or_default();
+    let populated = status.last_sync.is_some() || last_sync_db.is_some();
     let response = SyncStatusResponse {
         populated,
         running: status.running,
-        last_sync: status.last_sync,
+        last_sync: status.last_sync.or(last_sync_db),
         last_error: status.last_error,
         rebuild: state.db.get_sync_state("last_rebuild").unwrap_or_default(),
         dismiss_running: status.dismiss_running,
@@ -970,6 +984,43 @@ mod tests {
         assert_eq!(value["auth"]["authenticated"], true);
         assert_eq!(value["auth"]["login"], "octocat");
         assert_eq!(value["auth"]["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn api_responses_are_not_cached() {
+        let app = router(test_state());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/sync/status")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_status_falls_back_to_the_stored_last_sync() {
+        let state = test_state();
+        state
+            .db
+            .set_sync_state("last_sync", "2026-01-01T00:00:00Z")
+            .expect("set last sync");
+        let app = router(state);
+        let (status, body) = get_body(app, "/api/sync/status").await;
+        assert_eq!(status, StatusCode::OK);
+        let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["last_sync"], "2026-01-01T00:00:00Z");
+        assert_eq!(value["populated"], true);
     }
 
     #[tokio::test]

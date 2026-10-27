@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::http::StatusCode;
 use reqwest::header::{
@@ -18,6 +19,14 @@ const API_VERSION: &str = "2022-11-28";
 
 /// How many times to retry a request that GitHub rate limited before giving up.
 const MAX_RATE_RETRIES: u32 = 3;
+
+/// How long a single GitHub request may take before it is aborted. Without
+/// this, a stalled connection leaves a sync pass "running" forever and the UI
+/// spinner never clears.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long to wait for the TCP/TLS connection to GitHub.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Whether a response is a rate-limit rejection we should back off and retry.
 ///
@@ -49,9 +58,7 @@ fn is_rate_limited(status: StatusCode, headers: &HeaderMap, body: &[u8]) -> bool
 /// when present, otherwise exponential backoff (1s, 2s, 4s...). Capped so a
 /// sync can't hang for long; a 403 with a `x-ratelimit-reset` uses that only
 /// when it is a short wait.
-fn retry_delay(headers: &HeaderMap, attempt: u32) -> std::time::Duration {
-    use std::time::Duration;
-
+fn retry_delay(headers: &HeaderMap, attempt: u32) -> Duration {
     if let Some(secs) = headers
         .get("retry-after")
         .and_then(|v| v.to_str().ok())
@@ -120,6 +127,8 @@ impl Client {
         );
         let http = reqwest::Client::builder()
             .default_headers(headers)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .expect("building http client");
         Self {
