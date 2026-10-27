@@ -176,11 +176,35 @@ pub struct DiscussionNode {
     pub author: Option<GithubUser>,
     #[serde(default)]
     pub category: Option<DiscussionCategory>,
+    /// The repository the discussion belongs to, when returned by a search.
+    #[serde(default)]
+    pub repository: Option<DiscussionRepoRef>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct DiscussionCategory {
     pub name: String,
+}
+
+/// The repository reference attached to a discussion search result.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussionRepoRef {
+    pub name_with_owner: String,
+}
+
+/// The `data` shape of a GraphQL discussion search (organization-level
+/// discussions).
+#[derive(Debug, Deserialize)]
+pub struct DiscussionSearchPage {
+    #[serde(default)]
+    pub search: DiscussionSearch,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct DiscussionSearch {
+    #[serde(default)]
+    pub nodes: Vec<DiscussionNode>,
 }
 
 /// The authenticated user's subscription for a repository
@@ -264,6 +288,30 @@ mod tests {
         assert_eq!(
             results.items[0].user.as_ref().map(|u| u.login.as_str()),
             Some("alice")
+        );
+    }
+
+    #[test]
+    fn parses_discussion_search_results() {
+        let page: DiscussionSearchPage = serde_json::from_str(
+            r#"{"search":{"nodes":[{
+                "number": 447,
+                "title": "a feedback discussion",
+                "url": "https://github.com/orgs/o/discussions/447",
+                "createdAt": "2026-10-21T14:13:59Z",
+                "updatedAt": "2026-10-22T08:16:38Z",
+                "author": {"login": "alice"},
+                "category": {"name": "Q&A"},
+                "repository": {"nameWithOwner": "o/feedback"}
+            }]}}"#,
+        )
+        .expect("discussion search");
+        assert_eq!(page.search.nodes.len(), 1);
+        let node = &page.search.nodes[0];
+        assert_eq!(node.number, 447);
+        assert_eq!(
+            node.repository.as_ref().map(|r| r.name_with_owner.as_str()),
+            Some("o/feedback")
         );
     }
 

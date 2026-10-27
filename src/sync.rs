@@ -8,10 +8,10 @@ use tokio::sync::mpsc;
 
 use crate::config::{Config, Workspace};
 use crate::db::Database;
-use crate::github::{self, next_link, Client, RateLimit};
+use crate::github::{self, next_link, Client, GitResponse, RateLimit};
 use crate::models::{
-    ActionsRuns, CheckRun, DiscussionPage, GithubIssue, GithubPullRequest, NotificationThread,
-    RepoSubscription, SearchResults, WatchedRepo,
+    ActionsRuns, CheckRun, DiscussionPage, DiscussionSearchPage, GithubIssue, GithubPullRequest,
+    NotificationThread, RepoSubscription, SearchResults, WatchedRepo,
 };
 
 /// The workspace shown when the config has no workspaces yet.
@@ -853,6 +853,25 @@ query($owner: String!, $name: String!, $first: Int!) {
 }
 "#;
 
+const ORG_DISCUSSIONS_QUERY: &str = r#"
+query($q: String!, $first: Int!) {
+  search(query: $q, type: DISCUSSION, first: $first) {
+    nodes {
+      ... on Discussion {
+        number
+        title
+        url
+        createdAt
+        updatedAt
+        author { login }
+        category { name }
+        repository { nameWithOwner }
+      }
+    }
+  }
+}
+"#;
+
 /// Refresh the Summary tab's global data: pull requests awaiting review and
 /// new discussions for the configured projects.
 ///
@@ -934,11 +953,21 @@ async fn sync_discussions(
     config: &Config,
 ) -> Result<()> {
     for project in &config.discussions.projects {
-        let Some((owner, repo)) = discussion_repo(project) else {
-            tracing::warn!("skipping discussion project {project}: expected owner/repo or owner");
-            continue;
+        let result = match discussion_target(project) {
+            Some(DiscussionTarget::Repository { owner, repo }) => {
+                fetch_repository_discussions(client, status, &owner, &repo).await
+            }
+            Some(DiscussionTarget::Organization { org }) => {
+                fetch_organization_discussions(client, status, &org).await
+            }
+            None => {
+                tracing::warn!(
+                    "skipping discussion project {project}: expected owner/repo or owner"
+                );
+                continue;
+            }
         };
-        match fetch_discussions(client, status, &owner, &repo).await {
+        match result {
             Ok(nodes) => {
                 let items: Vec<crate::db::DiscussionItem> = nodes
                     .iter()
@@ -961,22 +990,40 @@ async fn sync_discussions(
     Ok(())
 }
 
-/// Resolve a configured discussions project to the repository that actually
-/// holds its discussions. A bare account name means org-level discussions,
-/// which GitHub stores in the account's `.github` repository.
-fn discussion_repo(project: &str) -> Option<(String, String)> {
+/// How a configured discussions project is queried.
+#[derive(Debug, PartialEq, Eq)]
+enum DiscussionTarget {
+    /// A single repository's discussions.
+    Repository { owner: String, repo: String },
+    /// Organization-level discussions, wherever the organization's source
+    /// repository happens to be (it is configurable and not always `.github`).
+    Organization { org: String },
+}
+
+/// Resolve a configured discussions project. A bare account name means
+/// organization-level discussions; `owner/.github` is accepted as an alias
+/// for the same thing (the conventional org community repository).
+fn discussion_target(project: &str) -> Option<DiscussionTarget> {
     match project.split_once('/') {
+        Some((owner, ".github")) if !owner.is_empty() => Some(DiscussionTarget::Organization {
+            org: owner.to_string(),
+        }),
         Some((owner, repo)) if !owner.is_empty() && !repo.is_empty() => {
-            Some((owner.to_string(), repo.to_string()))
+            Some(DiscussionTarget::Repository {
+                owner: owner.to_string(),
+                repo: repo.to_string(),
+            })
         }
         Some(_) => None,
-        None if !project.is_empty() => Some((project.to_string(), ".github".to_string())),
+        None if !project.is_empty() => Some(DiscussionTarget::Organization {
+            org: project.to_string(),
+        }),
         None => None,
     }
 }
 
-/// Fetch one project's most recently updated discussions.
-async fn fetch_discussions(
+/// Fetch one repository's most recently updated discussions.
+async fn fetch_repository_discussions(
     client: &Client,
     status: &Arc<Mutex<SyncStatus>>,
     owner: &str,
@@ -990,6 +1037,42 @@ async fn fetch_discussions(
         .await?;
     record_rate_limit(status, &response.headers);
 
+    let value = graphql_data(response)?;
+    let page: DiscussionPage = serde_json::from_value(value).context("parsing discussion page")?;
+    let Some(repo) = page.repository else {
+        anyhow::bail!("repository not found or not accessible");
+    };
+    Ok(repo.discussions.nodes)
+}
+
+/// Fetch an organization's most recently updated discussions. Organization
+/// discussions are backed by a source repository chosen by the org (often
+/// `.github`, but e.g. paketo-buildpacks uses `feedback`), so search the whole
+/// organization instead of guessing the repository.
+async fn fetch_organization_discussions(
+    client: &Client,
+    status: &Arc<Mutex<SyncStatus>>,
+    org: &str,
+) -> Result<Vec<crate::models::DiscussionNode>> {
+    let response = client
+        .graphql(
+            ORG_DISCUSSIONS_QUERY,
+            serde_json::json!({
+                "q": format!("org:{org} sort:updated-desc"),
+                "first": DISCUSSION_PAGE_SIZE,
+            }),
+        )
+        .await?;
+    record_rate_limit(status, &response.headers);
+
+    let value = graphql_data(response)?;
+    let page: DiscussionSearchPage =
+        serde_json::from_value(value).context("parsing discussion search page")?;
+    Ok(page.search.nodes)
+}
+
+/// Validate a GraphQL HTTP response and return its `data` object.
+fn graphql_data(response: GitResponse) -> Result<serde_json::Value> {
     if response.status != axum::http::StatusCode::OK {
         anyhow::bail!("graphql endpoint returned {}", response.status);
     }
@@ -998,15 +1081,10 @@ async fn fetch_discussions(
     if let Some(errors) = value.get("errors") {
         anyhow::bail!("graphql errors: {errors}");
     }
-    let data = value
+    value
         .get("data")
         .cloned()
-        .context("graphql response has no data")?;
-    let page: DiscussionPage = serde_json::from_value(data).context("parsing discussion page")?;
-    let Some(repo) = page.repository else {
-        anyhow::bail!("repository not found or not accessible");
-    };
-    Ok(repo.discussions.nodes)
+        .context("graphql response has no data")
 }
 
 /// `Some` for a non-empty string, `None` otherwise.
@@ -1211,19 +1289,31 @@ mod tests {
     }
 
     #[test]
-    fn discussion_projects_resolve_orgs_to_dot_github() {
+    fn discussion_projects_resolve_repos_and_orgs() {
         assert_eq!(
-            discussion_repo("cli/cli"),
-            Some(("cli".to_string(), "cli".to_string()))
+            discussion_target("cli/cli"),
+            Some(DiscussionTarget::Repository {
+                owner: "cli".to_string(),
+                repo: "cli".to_string()
+            })
         );
-        // A bare account name means the org-level Discussions page.
+        // A bare account name means organization-level discussions.
         assert_eq!(
-            discussion_repo("paketo-buildpacks"),
-            Some(("paketo-buildpacks".to_string(), ".github".to_string()))
+            discussion_target("paketo-buildpacks"),
+            Some(DiscussionTarget::Organization {
+                org: "paketo-buildpacks".to_string()
+            })
         );
-        assert_eq!(discussion_repo(""), None);
-        assert_eq!(discussion_repo("a/"), None);
-        assert_eq!(discussion_repo("/b"), None);
+        // `owner/.github` is an alias for the same org-level search.
+        assert_eq!(
+            discussion_target("paketo-buildpacks/.github"),
+            Some(DiscussionTarget::Organization {
+                org: "paketo-buildpacks".to_string()
+            })
+        );
+        assert_eq!(discussion_target(""), None);
+        assert_eq!(discussion_target("a/"), None);
+        assert_eq!(discussion_target("/b"), None);
     }
 
     /// A mock GitHub serving notifications, open issues, subscriptions, a PR
@@ -2174,7 +2264,7 @@ mod tests {
                 .join(",")
         );
         let discussion_updated = now_utc();
-        let graphql_body = serde_json::json!({
+        let repository_graphql_body = serde_json::json!({
             "data": {
                 "repository": {
                     "discussions": {
@@ -2192,6 +2282,23 @@ mod tests {
             }
         })
         .to_string();
+        let org_graphql_body = serde_json::json!({
+            "data": {
+                "search": {
+                    "nodes": [{
+                        "number": 447,
+                        "title": "a feedback discussion",
+                        "url": "https://github.com/orgs/o/discussions/447",
+                        "createdAt": "2026-10-21T00:00:00Z",
+                        "updatedAt": discussion_updated,
+                        "author": {"login": "carol"},
+                        "category": {"name": "Q&A"},
+                        "repository": {"nameWithOwner": "o/feedback"}
+                    }]
+                }
+            }
+        })
+        .to_string();
 
         let app = Router::new()
             .route(
@@ -2203,9 +2310,18 @@ mod tests {
             )
             .route(
                 "/graphql",
-                post(move || {
-                    let body = graphql_body.clone();
-                    async move { ([("ETag", "\"g1\"")], body) }
+                post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let repository = repository_graphql_body.clone();
+                    let organization = org_graphql_body.clone();
+                    async move {
+                        let query = body["query"].as_str().unwrap_or_default();
+                        let response = if query.contains("search(") {
+                            organization
+                        } else {
+                            repository
+                        };
+                        ([("ETag", "\"g1\"")], response)
+                    }
                 }),
             );
         tokio::spawn(async move {
@@ -2243,13 +2359,22 @@ mod tests {
             .list_recent_discussions(&["o/r".into(), "o".into()], 7, 50)
             .expect("discussions");
         assert_eq!(discussions.len(), 2, "one repo project and one org project");
-        assert!(discussions.iter().any(|d| d.repo == "o/r"));
-        // A bare account name resolves to that account's org-level discussions.
-        assert!(discussions.iter().any(|d| d.repo == "o"));
-        assert!(discussions
+        let repo_item = discussions
             .iter()
-            .all(|d| d.title == "a discussion" && d.category.as_deref() == Some("General")));
-        assert_eq!(discussions[0].author.as_deref(), Some("bob"));
+            .find(|d| d.repo == "o/r")
+            .expect("repository discussion");
+        assert_eq!(repo_item.title, "a discussion");
+        assert_eq!(repo_item.author.as_deref(), Some("bob"));
+        assert_eq!(repo_item.category.as_deref(), Some("General"));
+        // A bare account name searches the whole organization (the source
+        // repository is not necessarily .github).
+        let org_item = discussions
+            .iter()
+            .find(|d| d.repo == "o")
+            .expect("organization discussion");
+        assert_eq!(org_item.title, "a feedback discussion");
+        assert_eq!(org_item.url, "https://github.com/orgs/o/discussions/447");
+        assert_eq!(org_item.author.as_deref(), Some("carol"));
     }
 
     #[tokio::test]

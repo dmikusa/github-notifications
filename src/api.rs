@@ -1785,7 +1785,8 @@ mod tests {
         assert!(body.contains("data-settings-tab=\"discussions\""));
         assert!(body.contains("remove-discussion-project"));
         assert!(body.contains("cli/cli"));
-        assert!(body.contains("paketo-buildpacks/.github"));
+        assert!(body.contains("paketo-buildpacks"));
+        assert!(body.contains("Organization discussions (all repositories)"));
         assert!(body.contains("value=\"14\""));
     }
 

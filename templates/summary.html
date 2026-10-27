@@ -136,7 +136,7 @@
         {% for item in discussions %}
         <tr>
           <td class="chk"><input type="checkbox" class="summary-sel" value="{{ item.url }}" data-html-url="{{ item.url }}"></td>
-          <td class="repo">{{ item.repo }}{% if !item.repo.contains('/') %} <span class="badge">org</span>{% endif %}</td>
+          <td class="repo">{{ item.repo }}{% if !item.repo.contains('/') || item.repo.ends_with("/.github") %} <span class="badge">org</span>{% endif %}</td>
           <td class="num">#{{ item.number }}</td>
           <td class="title"><a href="{{ item.url }}" target="_blank" rel="noopener">{{ item.title }}</a></td>
           <td class="author">{% if let Some(author) = item.author.as_deref() %}{{ author }}{% endif %}</td>

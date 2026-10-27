@@ -87,7 +87,8 @@ fn default_sync_concurrency() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiscussionsConfig {
-    /// Explicit `owner/repo` projects to read discussions from.
+    /// `owner/repo` projects to read discussions from, or a bare `owner` to
+    /// search all discussions in an organization.
     #[serde(default)]
     pub projects: Vec<String>,
     /// Only show discussions updated within this many days.
@@ -282,8 +283,10 @@ sync_dismiss_to_github = false
 # follow are often different from the repos you triage notifications for.
 # Discussions only ever appear on the Summary tab.
 #
-# Use "owner/repo" for a repository, or just "owner" for an organization's
-# Discussions page (GitHub stores those in the owner/.github repository).
+# Use "owner/repo" for a repository, or just "owner" for all discussions in
+# an organization. Organization discussions live in a source repository the
+# org chooses (often .github or feedback), so the app searches the whole org;
+# "owner/.github" is also accepted as an org-level alias.
 #
 # recent_days controls how far back a discussion can be updated and still show
 # up. Defaults to 7 days.

@@ -51,9 +51,11 @@
     <h2 class="view-title">Discussions projects</h2>
     <p class="muted">
       Projects whose Discussions appear on the Summary tab. Use
-      <code>owner/repo</code> for a repository, or just <code>owner</code> for an
-      organization&rsquo;s Discussions page (GitHub stores those in
-      <code>owner/.github</code>).
+      <code>owner/repo</code> for a single repository, or just <code>owner</code>
+      for all discussions across an organization. (GitHub stores organization
+      discussions in a source repository such as <code>.github</code> or
+      <code>feedback</code>; the app searches the whole organization, so you
+      don&rsquo;t need to know which one.)
     </p>
 
     <div class="repo-set-list">
@@ -64,7 +66,7 @@
           <button class="danger" data-action="remove-discussion-project" data-project="{{ project }}">Remove</button>
         </div>
         <p class="muted">
-          {% if project.contains('/') %}Repository discussions{% else %}Organization discussions ({{ project }}/.github){% endif %}
+          {% if project.contains('/') && !project.ends_with("/.github") %}Repository discussions{% else %}Organization discussions (all repositories){% endif %}
         </p>
       </div>
       {% else %}
