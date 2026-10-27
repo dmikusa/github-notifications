@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use anyhow::{Context, Result};
 use askama::Template;
 
-use crate::config::{Config, RepoSet, Workspace};
+use crate::config::{Config, DiscussionsConfig, RepoSet, Workspace};
 use crate::db::{self, Database};
 
 /// The workspace shown when the config has no workspaces yet.
@@ -175,12 +175,16 @@ struct SummaryTemplate<'a> {
     recent_days: u64,
 }
 
+/// Maximum rows shown per Summary thread section. The tables scroll, showing
+/// roughly ten at a time.
+const SUMMARY_THREAD_LIMIT: usize = 30;
+
 /// Render the Summary dashboard fragment for `workspace` and the global
 /// discussions config.
 pub fn render_summary(db: &Database, workspace: &Workspace, config: &Config) -> Result<String> {
     let repos = workspace.tracked_repos();
-    let mentions = db.list_mentions(&repos, 50)?;
-    let ci_failures = db.list_ci_failures(&repos, 50)?;
+    let mentions = db.list_mentions(&repos, SUMMARY_THREAD_LIMIT)?;
+    let ci_failures = db.list_ci_failures(&repos, SUMMARY_THREAD_LIMIT)?;
     let recent_days = config.discussions.effective_recent_days();
     let discussions = db.list_recent_discussions(&config.discussions.projects, recent_days, 50)?;
     let reviews = db.list_review_requests(10)?;
@@ -225,13 +229,18 @@ pub fn render_repos(db: &Database, workspace: &Workspace, q: &RepoParams) -> Res
 struct SettingsTemplate<'a> {
     ws: &'a str,
     repo_sets: &'a [RepoSet],
+    discussion_projects: &'a [String],
+    recent_days: u64,
 }
 
-/// Render the settings view fragment (repo set management) for `workspace`.
-pub fn render_settings(workspace: &Workspace) -> Result<String> {
+/// Render the settings view fragment (repo set and discussion project
+/// management) for `workspace`.
+pub fn render_settings(workspace: &Workspace, discussions: &DiscussionsConfig) -> Result<String> {
     let template = SettingsTemplate {
         ws: &workspace.name,
         repo_sets: &workspace.repo_sets,
+        discussion_projects: &discussions.projects,
+        recent_days: discussions.effective_recent_days(),
     };
     template.render().context("rendering settings view")
 }
@@ -729,8 +738,10 @@ mod tests {
         assert!(html.contains("a new discussion"));
         assert!(html.contains("Review requests"));
         assert!(html.contains("a pr needing review"));
-        // Mention and CI rows offer a mark-read action.
-        assert!(html.contains("summary-read"));
+        // Mention and CI rows are selectable and the bulk bar offers dismiss.
+        assert!(html.contains("summary-sel"));
+        assert!(html.contains("summary-scroll"));
+        assert!(html.contains(r#"data-summary-action="dismiss""#));
         assert!(html.contains("updated in the last 7 days"));
     }
 
@@ -750,13 +761,56 @@ mod tests {
     }
 
     #[test]
+    fn summary_caps_mention_rows_at_thirty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("db");
+        db.upsert_repo("o/r", Some("https://github.com/o/r"))
+            .expect("repo");
+        for n in 1..=35u64 {
+            db.upsert_thread(&NotificationThread {
+                id: format!("{n}:mention"),
+                unread: true,
+                reason: "mention".into(),
+                updated_at: format!("2026-09-{:02}T12:00:00Z", (n % 28) + 1),
+                last_read_at: None,
+                subject: ThreadSubject {
+                    title: format!("mention {n}"),
+                    kind: "Issue".into(),
+                    url: Some(format!("https://api.github.com/repos/o/r/issues/{n}")),
+                    latest_comment_url: None,
+                },
+                repository: Some(ThreadRepository {
+                    full_name: "o/r".into(),
+                    html_url: "https://github.com/o/r".into(),
+                }),
+                url: format!("https://api.github.com/notifications/threads/{n}"),
+            })
+            .expect("mention");
+        }
+        let ws = Workspace {
+            name: "w".into(),
+            repo_sets: vec![RepoSet {
+                name: "s".into(),
+                repos: vec!["o/r".into()],
+            }],
+            ..Default::default()
+        };
+        let html = render_summary(&db, &ws, &Config::default()).expect("render");
+        assert_eq!(
+            html.matches(r#"class="summary-sel""#).count(),
+            SUMMARY_THREAD_LIMIT,
+            "long mention lists are capped"
+        );
+    }
+
+    #[test]
     fn settings_empty_state_renders_em_dash() {
         let ws = Workspace {
             name: "w".into(),
             repo_sets: vec![],
             ..Default::default()
         };
-        let html = render_settings(&ws).expect("render");
+        let html = render_settings(&ws, &DiscussionsConfig::default()).expect("render");
         // Regression: a literal `\u2014` in the template was rendered as text.
         assert!(!html.contains(r"\u2014"));
         assert!(html.contains("&mdash;"));

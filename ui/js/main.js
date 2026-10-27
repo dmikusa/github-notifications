@@ -141,10 +141,13 @@ async function onSyncStatus(status) {
 function restoreSelection(values) {
   if (!values || !values.length) return;
   const wanted = new Set(values);
-  document.querySelectorAll('#view .sel').forEach((cb) => {
+  document.querySelectorAll('#view .sel, #view .summary-sel').forEach((cb) => {
     if (wanted.has(cb.value)) cb.checked = true;
   });
   if (window.App.table.bind) window.App.table.bind();
+  if (window.App.views.summary && window.App.views.summary.update) {
+    window.App.views.summary.update();
+  }
 }
 
 async function syncStatusTick() {

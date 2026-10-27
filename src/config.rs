@@ -282,11 +282,14 @@ sync_dismiss_to_github = false
 # follow are often different from the repos you triage notifications for.
 # Discussions only ever appear on the Summary tab.
 #
+# Use "owner/repo" for a repository, or just "owner" for an organization's
+# Discussions page (GitHub stores those in the owner/.github repository).
+#
 # recent_days controls how far back a discussion can be updated and still show
 # up. Defaults to 7 days.
 #
 # [discussions]
-# projects = ["org1/repo-a"]
+# projects = ["org1/repo-a", "org2"]
 # recent_days = 7
 
 # Workspaces group repos and saved filters into separate views (e.g. personal
@@ -430,6 +433,73 @@ pub fn remove_repo(path: &Path, workspace: &str, set_name: &str, repo: &str) -> 
         anyhow::bail!("repo {repo:?} not found");
     }
     write_doc(path, &doc)
+}
+
+/// Add a project to the `[discussions] projects` list. A project is either
+/// `owner/repo` or a bare `owner` for the account's org-level discussions.
+/// Duplicates are ignored.
+pub fn add_discussion_project(path: &Path, project: &str) -> Result<()> {
+    let project = normalize_discussion_project(project)?;
+    let mut doc = load_doc(path)?;
+    let table = discussions_table_mut(&mut doc)?;
+    if !table.contains_key("projects") {
+        table.insert("projects", Item::Value(toml_edit::Array::new().into()));
+    }
+    let array = table["projects"]
+        .as_array_mut()
+        .context("discussions.projects is not an array")?;
+    if !array.iter().any(|v| v.as_str() == Some(project.as_str())) {
+        array.push(toml_edit::Value::from(project.as_str()));
+    }
+    write_doc(path, &doc)
+}
+
+/// Remove a project from the `[discussions] projects` list.
+pub fn remove_discussion_project(path: &Path, project: &str) -> Result<()> {
+    let mut doc = load_doc(path)?;
+    let Some(table) = doc.get_mut("discussions").and_then(Item::as_table_mut) else {
+        anyhow::bail!("discussion project {project:?} not found");
+    };
+    let Some(array) = table.get_mut("projects").and_then(Item::as_array_mut) else {
+        anyhow::bail!("discussion project {project:?} not found");
+    };
+    let before = array.len();
+    array.retain(|v| v.as_str() != Some(project));
+    if array.len() == before {
+        anyhow::bail!("discussion project {project:?} not found");
+    }
+    write_doc(path, &doc)
+}
+
+/// Set how many days back the Summary tab shows discussions.
+pub fn set_discussion_recent_days(path: &Path, days: u64) -> Result<()> {
+    let mut doc = load_doc(path)?;
+    let table = discussions_table_mut(&mut doc)?;
+    table.insert("recent_days", value(days.max(1) as i64));
+    write_doc(path, &doc)
+}
+
+/// Validate and normalize a discussions project entry: trim whitespace and a
+/// trailing slash (a common typo).
+fn normalize_discussion_project(project: &str) -> Result<String> {
+    let project = project.trim().trim_end_matches('/');
+    if project.is_empty() {
+        anyhow::bail!("discussion project is required");
+    }
+    if project.chars().any(char::is_whitespace) || project.matches('/').count() > 1 {
+        anyhow::bail!("discussion project must be owner/repo or owner");
+    }
+    Ok(project.to_string())
+}
+
+/// Get (creating if needed) the `[discussions]` table.
+fn discussions_table_mut(doc: &mut DocumentMut) -> Result<&mut Table> {
+    if !doc.contains_key("discussions") {
+        doc.insert("discussions", Item::Table(Table::new()));
+    }
+    doc["discussions"]
+        .as_table_mut()
+        .context("discussions is not a table")
 }
 
 fn load_doc(path: &Path) -> Result<DocumentMut> {
@@ -810,6 +880,58 @@ bogus = true
             config.workspaces[0].repo_sets[0].repos,
             vec!["a/r".to_string()]
         );
+    }
+
+    #[test]
+    fn editor_manages_discussion_projects() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = editor_config(dir.path(), "[github]\nauth_provider = \"gh-token\"\n");
+        add_discussion_project(&path, "org/repo").expect("add repo");
+        // Adding the same project twice does not duplicate it.
+        add_discussion_project(&path, "org/repo").expect("duplicate");
+        // A trailing slash means org-level discussions, normalized to the org.
+        add_discussion_project(&path, "paketo-buildpacks/").expect("add org");
+        let config = read_file(&path).expect("read");
+        assert_eq!(
+            config.discussions.projects,
+            vec!["org/repo".to_string(), "paketo-buildpacks".to_string()]
+        );
+
+        set_discussion_recent_days(&path, 0).expect("set days");
+        let config = read_file(&path).expect("read");
+        assert_eq!(config.discussions.recent_days, 1, "clamped to one day");
+
+        remove_discussion_project(&path, "org/repo").expect("remove");
+        let config = read_file(&path).expect("read");
+        assert_eq!(
+            config.discussions.projects,
+            vec!["paketo-buildpacks".to_string()]
+        );
+        assert!(remove_discussion_project(&path, "nope").is_err());
+    }
+
+    #[test]
+    fn editor_rejects_bad_discussion_projects() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = editor_config(dir.path(), "[github]\nauth_provider = \"gh-token\"\n");
+        assert!(add_discussion_project(&path, "   ").is_err());
+        assert!(add_discussion_project(&path, "a/b/c").is_err());
+        assert!(add_discussion_project(&path, "a b").is_err());
+    }
+
+    #[test]
+    fn editor_discussion_changes_preserve_comments() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, CONFIG_TEMPLATE).expect("write template");
+        add_discussion_project(&path, "cli/cli").expect("add");
+        set_discussion_recent_days(&path, 14).expect("days");
+        let raw = fs::read_to_string(&path).expect("read");
+        assert!(raw.contains("# github-notifications configuration"));
+        assert!(raw.contains("# GitHub Discussions projects shown"));
+        let config = read_file(&path).expect("read");
+        assert_eq!(config.discussions.projects, vec!["cli/cli".to_string()]);
+        assert_eq!(config.discussions.recent_days, 14);
     }
 
     #[test]

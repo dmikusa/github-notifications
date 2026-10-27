@@ -16,7 +16,9 @@ window.App.table = (() => {
   }
 
   function selected() {
-    return Array.from(document.querySelectorAll('#view .sel:checked')).map((cb) => cb.value);
+    return Array.from(
+      document.querySelectorAll('#view .sel:checked, #view .summary-sel:checked')
+    ).map((cb) => cb.value);
   }
 
   function selectedUrls() {

@@ -61,6 +61,29 @@ body {
   color: #fff;
 }
 
+.subnav {
+  display: flex;
+  gap: 0.25rem;
+  margin-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.subtab {
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  padding: 0.45rem 0.75rem;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.subtab.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
 .ws-select {
   margin-left: auto;
   padding: 0.3rem 0.5rem;
@@ -207,6 +230,20 @@ body {
   padding: 0.3rem 0.5rem;
   border: 1px solid var(--border);
   border-radius: 6px;
+}
+
+.filters input[type="number"] {
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.num-input {
+  width: 5rem;
+}
+
+#discussion-project-form input[type="text"] {
+  min-width: 20rem;
 }
 
 .filters label {
@@ -419,6 +456,28 @@ button.primary {
   color: var(--muted);
   font-size: 12px;
   font-weight: 400;
+}
+
+/* Long Summary sections scroll instead of stretching the page: about ten
+   rows are visible at a time, with the header pinned. */
+.summary-scroll {
+  max-height: 24rem;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+}
+
+.summary-scroll table.data {
+  border: none;
+  border-radius: 0;
+}
+
+.summary-scroll thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--panel);
 }
 
 .card {

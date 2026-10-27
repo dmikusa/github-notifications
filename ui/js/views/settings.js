@@ -1,8 +1,7 @@
 // js/views/settings.js:
-// Repo set management: remove repo sets/repos, and an org browser that
-// checkbox-selects repos and saves them into a repo set (config write-back).
-// The org browser filters server-side (GitHub search) so it works across the
-// whole org, not just the already-loaded page.
+// Settings sub-tabs: repo set management (remove sets/repos and browse an org
+// to save a set) and discussion project management (add/remove projects and
+// set the recent window). All edits write back to config.toml.
 window.App = window.App || {};
 
 window.App.settings = (() => {
@@ -11,6 +10,9 @@ window.App.settings = (() => {
   let hasMore = false;
   let selected = new Set();
   let filterTimer = null;
+  // Survive the view re-render after an edit so the user stays on the tab
+  // they were working in.
+  let activeTab = 'reposets';
 
   function el(id) {
     return document.getElementById(id);
@@ -30,6 +32,18 @@ window.App.settings = (() => {
       btn.disabled = false;
       btn.textContent = btn.dataset.label || btn.textContent;
     }
+  }
+
+  function showTab(tab) {
+    activeTab = tab;
+    const root = document.querySelector('#view');
+    if (!root) return;
+    root.querySelectorAll('[data-settings-tab]').forEach((btn) => {
+      btn.classList.toggle('active', btn.dataset.settingsTab === tab);
+    });
+    root.querySelectorAll('[data-settings-panel]').forEach((panel) => {
+      panel.hidden = panel.dataset.settingsPanel !== tab;
+    });
   }
 
   function renderRepos(repos) {
@@ -97,14 +111,24 @@ window.App.settings = (() => {
     const root = document.querySelector('#view');
     if (!root) return;
 
+    showTab(activeTab);
+    root.querySelectorAll('[data-settings-tab]').forEach((btn) => {
+      btn.addEventListener('click', () => showTab(btn.dataset.settingsTab));
+    });
+
     root.querySelectorAll('[data-action="remove-set"]').forEach((btn) => {
       btn.addEventListener('click', async () => {
         setBusy(btn, true, 'Removing\u2026');
         const ws = window.App.state.currentWorkspace;
-        await window.App.api.deleteJSON(
-          `/api/workspaces/${encodeURIComponent(ws)}/repo-sets/${encodeURIComponent(btn.dataset.set)}`
-        );
-        reload();
+        try {
+          await window.App.api.deleteJSON(
+            `/api/workspaces/${encodeURIComponent(ws)}/repo-sets/${encodeURIComponent(btn.dataset.set)}`
+          );
+          await reload();
+        } catch (err) {
+          window.App.flash.show(`Remove failed: ${err.message}`, true);
+          setBusy(btn, false);
+        }
       });
     });
 
@@ -112,12 +136,71 @@ window.App.settings = (() => {
       btn.addEventListener('click', async () => {
         setBusy(btn, true, '\u2026');
         const ws = window.App.state.currentWorkspace;
-        await window.App.api.deleteJSON(
-          `/api/workspaces/${encodeURIComponent(ws)}/repo-sets/${encodeURIComponent(btn.dataset.set)}/repos/${encodeURIComponent(btn.dataset.repo)}`
-        );
-        reload();
+        try {
+          await window.App.api.deleteJSON(
+            `/api/workspaces/${encodeURIComponent(ws)}/repo-sets/${encodeURIComponent(btn.dataset.set)}/repos/${encodeURIComponent(btn.dataset.repo)}`
+          );
+          await reload();
+        } catch (err) {
+          window.App.flash.show(`Remove failed: ${err.message}`, true);
+          setBusy(btn, false);
+        }
       });
     });
+
+    root.querySelectorAll('[data-action="remove-discussion-project"]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        setBusy(btn, true, 'Removing\u2026');
+        activeTab = 'discussions';
+        try {
+          await window.App.api.deleteJSON(
+            `/api/discussions/projects/${encodeURIComponent(btn.dataset.project)}`
+          );
+          await reload();
+        } catch (err) {
+          window.App.flash.show(`Remove failed: ${err.message}`, true);
+          setBusy(btn, false);
+        }
+      });
+    });
+
+    const projectForm = el('discussion-project-form');
+    if (projectForm) {
+      projectForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const project = projectForm.elements.project.value.trim();
+        if (!project) return;
+        const btn = projectForm.querySelector('button[type="submit"]');
+        setBusy(btn, true, 'Adding\u2026');
+        activeTab = 'discussions';
+        try {
+          await window.App.api.postJSON('/api/discussions/projects', { project });
+          await reload();
+        } catch (err) {
+          window.App.flash.show(`Add project failed: ${err.message}`, true);
+          setBusy(btn, false);
+        }
+      });
+    }
+
+    const windowForm = el('discussion-window-form');
+    if (windowForm) {
+      windowForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const days = Math.floor(Number(windowForm.elements.recent_days.value));
+        if (!Number.isFinite(days) || days < 1) return;
+        const btn = windowForm.querySelector('button[type="submit"]');
+        setBusy(btn, true, 'Saving\u2026');
+        activeTab = 'discussions';
+        try {
+          await window.App.api.postJSON('/api/discussions/settings', { recent_days: days });
+          await reload();
+        } catch (err) {
+          window.App.flash.show(`Save failed: ${err.message}`, true);
+          setBusy(btn, false);
+        }
+      });
+    }
 
     const form = el('org-picker');
     if (!form) return;
@@ -155,7 +238,8 @@ window.App.settings = (() => {
         );
         selected = new Set();
         await reload();
-      } finally {
+      } catch (err) {
+        window.App.flash.show(`Save failed: ${err.message}`, true);
         setBusy(el('save-set'), false);
       }
     });

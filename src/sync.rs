@@ -933,17 +933,17 @@ async fn sync_discussions(
     status: &Arc<Mutex<SyncStatus>>,
     config: &Config,
 ) -> Result<()> {
-    for full_name in &config.discussions.projects {
-        let Some((owner, name)) = full_name.split_once('/') else {
-            tracing::warn!("skipping discussion project {full_name}: expected owner/repo");
+    for project in &config.discussions.projects {
+        let Some((owner, repo)) = discussion_repo(project) else {
+            tracing::warn!("skipping discussion project {project}: expected owner/repo or owner");
             continue;
         };
-        match fetch_discussions(client, status, owner, name).await {
+        match fetch_discussions(client, status, &owner, &repo).await {
             Ok(nodes) => {
                 let items: Vec<crate::db::DiscussionItem> = nodes
                     .iter()
                     .map(|node| crate::db::DiscussionItem {
-                        repo: full_name.clone(),
+                        repo: project.clone(),
                         number: node.number as i64,
                         title: node.title.clone(),
                         url: node.url.clone(),
@@ -953,12 +953,26 @@ async fn sync_discussions(
                         updated_at: non_empty(&node.updated_at),
                     })
                     .collect();
-                db.replace_discussions(full_name, &items)?;
+                db.replace_discussions(project, &items)?;
             }
-            Err(e) => tracing::warn!("skipping discussions for {full_name}: {e}"),
+            Err(e) => tracing::warn!("skipping discussions for {project}: {e}"),
         }
     }
     Ok(())
+}
+
+/// Resolve a configured discussions project to the repository that actually
+/// holds its discussions. A bare account name means org-level discussions,
+/// which GitHub stores in the account's `.github` repository.
+fn discussion_repo(project: &str) -> Option<(String, String)> {
+    match project.split_once('/') {
+        Some((owner, repo)) if !owner.is_empty() && !repo.is_empty() => {
+            Some((owner.to_string(), repo.to_string()))
+        }
+        Some(_) => None,
+        None if !project.is_empty() => Some((project.to_string(), ".github".to_string())),
+        None => None,
+    }
 }
 
 /// Fetch one project's most recently updated discussions.
@@ -1194,6 +1208,22 @@ mod tests {
         assert!(due(&Some("not-a-date".into()), 60));
         let recent = now_utc();
         assert!(!due(&Some(recent), 60));
+    }
+
+    #[test]
+    fn discussion_projects_resolve_orgs_to_dot_github() {
+        assert_eq!(
+            discussion_repo("cli/cli"),
+            Some(("cli".to_string(), "cli".to_string()))
+        );
+        // A bare account name means the org-level Discussions page.
+        assert_eq!(
+            discussion_repo("paketo-buildpacks"),
+            Some(("paketo-buildpacks".to_string(), ".github".to_string()))
+        );
+        assert_eq!(discussion_repo(""), None);
+        assert_eq!(discussion_repo("a/"), None);
+        assert_eq!(discussion_repo("/b"), None);
     }
 
     /// A mock GitHub serving notifications, open issues, subscriptions, a PR
@@ -2192,7 +2222,7 @@ mod tests {
         let config = Config {
             github: Default::default(),
             discussions: crate::config::DiscussionsConfig {
-                projects: vec!["o/r".into()],
+                projects: vec!["o/r".into(), "o".into()],
                 recent_days: 7,
             },
             workspaces: Vec::new(),
@@ -2210,13 +2240,16 @@ mod tests {
         assert_eq!(reviews[0].number, 12, "most recently updated first");
 
         let discussions = db
-            .list_recent_discussions(&["o/r".into()], 7, 50)
+            .list_recent_discussions(&["o/r".into(), "o".into()], 7, 50)
             .expect("discussions");
-        assert_eq!(discussions.len(), 1);
-        assert_eq!(discussions[0].repo, "o/r");
-        assert_eq!(discussions[0].title, "a discussion");
+        assert_eq!(discussions.len(), 2, "one repo project and one org project");
+        assert!(discussions.iter().any(|d| d.repo == "o/r"));
+        // A bare account name resolves to that account's org-level discussions.
+        assert!(discussions.iter().any(|d| d.repo == "o"));
+        assert!(discussions
+            .iter()
+            .all(|d| d.title == "a discussion" && d.category.as_deref() == Some("General")));
         assert_eq!(discussions[0].author.as_deref(), Some("bob"));
-        assert_eq!(discussions[0].category.as_deref(), Some("General"));
     }
 
     #[tokio::test]
