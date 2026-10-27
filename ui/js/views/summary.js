@@ -1,40 +1,52 @@
 // js/views/summary.js:
 // Summary dashboard: mentions, CI failures, recent discussions, and review
-// requests. Mention and CI rows are selectable; the bulk bar marks them read
-// or dismisses them.
+// requests. Each section selects and acts only on its own rows.
 window.App = window.App || {};
 
 window.App.views = window.App.views || {};
 
 window.App.views.summary = (() => {
-  function boxes() {
-    return Array.from(document.querySelectorAll('#view .summary-sel'));
+  function sectionRoot(section) {
+    return document.querySelector(`#view .summary-section[data-section="${section}"]`);
   }
 
-  function selected() {
-    return boxes().filter((cb) => cb.checked);
+  function boxes(section) {
+    const root = sectionRoot(section);
+    return root ? Array.from(root.querySelectorAll('.summary-sel')) : [];
   }
 
-  // Reflect the current selection in the bulk bar and each section's
+  function selected(section) {
+    return boxes(section).filter((cb) => cb.checked);
+  }
+
+  // Reflect the section's selection in its count, action buttons, and
   // select-all checkbox.
-  function update() {
-    const sel = selected();
-    const count = document.querySelector('#view .summary-sel-count');
+  function updateSection(section) {
+    const root = sectionRoot(section);
+    if (!root) return;
+    const sel = selected(section);
+    const count = root.querySelector(`[data-sel-count="${section}"]`);
     if (count) count.textContent = sel.length ? `${sel.length} selected` : '';
-    document.querySelectorAll('#view [data-summary-action]').forEach((btn) => {
+    root.querySelectorAll('[data-summary-action]').forEach((btn) => {
       btn.disabled = sel.length === 0;
     });
-    document.querySelectorAll('#view .summary-sel-all').forEach((all) => {
-      const table = all.closest('table');
-      const rows = table ? Array.from(table.querySelectorAll('.summary-sel')) : [];
+    const all = root.querySelector('.summary-sel-all');
+    if (all) {
+      const rows = boxes(section);
       const checked = rows.filter((cb) => cb.checked).length;
       all.checked = rows.length > 0 && checked === rows.length;
       all.indeterminate = checked > 0 && checked < rows.length;
+    }
+  }
+
+  function updateAll() {
+    document.querySelectorAll('#view .summary-section').forEach((section) => {
+      updateSection(section.dataset.section);
     });
   }
 
-  async function run(action) {
-    const sel = selected();
+  async function run(action, section) {
+    const sel = selected(section);
     if (!sel.length) return;
     const ids = sel.map((cb) => cb.value);
     if (action === 'open') {
@@ -65,15 +77,17 @@ window.App.views.summary = (() => {
     const target = e.target;
     if (!(target instanceof Element)) return;
     if (target.matches('#view .summary-sel-all')) {
-      const table = target.closest('table');
-      if (table) {
-        table.querySelectorAll('.summary-sel').forEach((cb) => {
+      const section = target.dataset.section;
+      const root = sectionRoot(section);
+      if (root) {
+        root.querySelectorAll('.summary-sel').forEach((cb) => {
           cb.checked = target.checked;
         });
       }
-      update();
+      updateSection(section);
     } else if (target.matches('#view .summary-sel')) {
-      update();
+      const section = target.closest('.summary-section')?.dataset.section;
+      if (section) updateSection(section);
     }
   });
 
@@ -81,8 +95,8 @@ window.App.views.summary = (() => {
     const target = e.target;
     if (!(target instanceof Element)) return;
     const btn = target.closest('#view [data-summary-action]');
-    if (btn) run(btn.dataset.summaryAction);
+    if (btn) run(btn.dataset.summaryAction, btn.dataset.section);
   });
 
-  return { update };
+  return { update: updateAll };
 })();

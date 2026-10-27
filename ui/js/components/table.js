@@ -41,7 +41,7 @@ window.App.table = (() => {
     const root = document.querySelector('#view');
     if (!root) return;
     const bar = root.querySelector('.bulk-bar');
-    const count = root.querySelector('.sel-count');
+    const count = bar ? bar.querySelector('.sel-count') : null;
     const sel = selected();
     // The action buttons stay visible at all times so the layout never shifts;
     // they're just disabled until something is selected.

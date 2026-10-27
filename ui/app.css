@@ -458,6 +458,39 @@ button.primary {
   font-weight: 400;
 }
 
+.section-head {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+.section-head .section-title {
+  flex: 1;
+  margin: 0;
+}
+
+.section-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.section-select {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.section-actions .sel-count {
+  color: var(--muted);
+  font-size: 12px;
+}
+
 /* Long Summary sections scroll instead of stretching the page: about ten
    rows are visible at a time, with the header pinned. */
 .summary-scroll {

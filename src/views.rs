@@ -738,10 +738,16 @@ mod tests {
         assert!(html.contains("a new discussion"));
         assert!(html.contains("Review requests"));
         assert!(html.contains("a pr needing review"));
-        // Mention and CI rows are selectable and the bulk bar offers dismiss.
+        // Mention and CI rows are selectable and each section has its own
+        // scoped select/dismiss/open controls.
         assert!(html.contains("summary-sel"));
         assert!(html.contains("summary-scroll"));
-        assert!(html.contains(r#"data-summary-action="dismiss""#));
+        assert!(!html.contains("summary-bulk-bar"));
+        assert_eq!(html.matches(r#"class="summary-sel-all""#).count(), 4);
+        assert!(html.contains(r#"data-summary-action="dismiss" data-section="mentions""#));
+        assert!(html.contains(r#"data-summary-action="dismiss" data-section="ci""#));
+        assert!(html.contains(r#"data-summary-action="open" data-section="discussions""#));
+        assert!(html.contains(r#"data-summary-action="open" data-section="reviews""#));
         assert!(html.contains("updated in the last 7 days"));
     }
 
