@@ -120,34 +120,36 @@
         </button>
       </div>
     </div>
-    <table class="data">
-      <thead>
-        <tr>
-          <th class="chk"></th>
-          <th>Repo</th>
-          <th>#</th>
-          <th>Title</th>
-          <th>Author</th>
-          <th>Category</th>
-          <th>Updated</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for item in discussions %}
-        <tr>
-          <td class="chk"><input type="checkbox" class="summary-sel" value="{{ item.url }}" data-html-url="{{ item.url }}"></td>
-          <td class="repo">{{ item.repo }}{% if !item.repo.contains('/') || item.repo.ends_with("/.github") %} <span class="badge">org</span>{% endif %}</td>
-          <td class="num">#{{ item.number }}</td>
-          <td class="title"><a href="{{ item.url }}" target="_blank" rel="noopener">{{ item.title }}</a></td>
-          <td class="author">{% if let Some(author) = item.author.as_deref() %}{{ author }}{% endif %}</td>
-          <td>{% if let Some(category) = item.category.as_deref() %}<span class="badge">{{ category }}</span>{% endif %}</td>
-          <td class="time">{% if let Some(updated) = item.updated_at.as_deref() %}{{ updated }}{% endif %}</td>
-        </tr>
-        {% else %}
-        <tr><td colspan="7" class="empty">No recent discussions. Add projects in Settings &rarr; Discussions.</td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
+    <div class="summary-scroll">
+      <table class="data">
+        <thead>
+          <tr>
+            <th class="chk"></th>
+            <th>Repo</th>
+            <th>#</th>
+            <th>Title</th>
+            <th>Author</th>
+            <th>Category</th>
+            <th>Updated</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in discussions %}
+          <tr>
+            <td class="chk"><input type="checkbox" class="summary-sel" value="{{ item.url }}" data-html-url="{{ item.url }}"></td>
+            <td class="repo">{{ item.repo }}{% if !item.repo.contains('/') || item.repo.ends_with("/.github") %} <span class="badge">org</span>{% endif %}</td>
+            <td class="num">#{{ item.number }}</td>
+            <td class="title"><a href="{{ item.url }}" target="_blank" rel="noopener">{{ item.title }}</a></td>
+            <td class="author">{% if let Some(author) = item.author.as_deref() %}{{ author }}{% endif %}</td>
+            <td>{% if let Some(category) = item.category.as_deref() %}<span class="badge">{{ category }}</span>{% endif %}</td>
+            <td class="time">{% if let Some(updated) = item.updated_at.as_deref() %}{{ updated }}{% endif %}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="7" class="empty">{% if has_discussion_projects %}No recent discussions in the last {{ recent_days }} day{% if recent_days != 1 %}s{% endif %}.{% else %}No discussions configured. Add projects in Settings &rarr; Discussions.{% endif %}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
   </section>
 
   <section class="summary-section" data-section="reviews">
@@ -163,31 +165,33 @@
         </button>
       </div>
     </div>
-    <table class="data">
-      <thead>
-        <tr>
-          <th class="chk"></th>
-          <th>Repo</th>
-          <th>#</th>
-          <th>Title</th>
-          <th>Author</th>
-          <th>Updated</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for item in reviews %}
-        <tr>
-          <td class="chk"><input type="checkbox" class="summary-sel" value="{{ item.html_url }}" data-html-url="{{ item.html_url }}"></td>
-          <td class="repo">{{ item.repo }}</td>
-          <td class="num">#{{ item.number }}</td>
-          <td class="title"><a href="{{ item.html_url }}" target="_blank" rel="noopener">{{ item.title }}</a></td>
-          <td class="author">{% if let Some(author) = item.author.as_deref() %}{{ author }}{% endif %}</td>
-          <td class="time">{% if let Some(updated) = item.updated_at.as_deref() %}{{ updated }}{% endif %}</td>
-        </tr>
-        {% else %}
-        <tr><td colspan="6" class="empty">No pull requests are waiting on your review.</td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
+    <div class="summary-scroll">
+      <table class="data">
+        <thead>
+          <tr>
+            <th class="chk"></th>
+            <th>Repo</th>
+            <th>#</th>
+            <th>Title</th>
+            <th>Author</th>
+            <th>Updated</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in reviews %}
+          <tr>
+            <td class="chk"><input type="checkbox" class="summary-sel" value="{{ item.html_url }}" data-html-url="{{ item.html_url }}"></td>
+            <td class="repo">{{ item.repo }}</td>
+            <td class="num">#{{ item.number }}</td>
+            <td class="title"><a href="{{ item.html_url }}" target="_blank" rel="noopener">{{ item.title }}</a></td>
+            <td class="author">{% if let Some(author) = item.author.as_deref() %}{{ author }}{% endif %}</td>
+            <td class="time">{% if let Some(updated) = item.updated_at.as_deref() %}{{ updated }}{% endif %}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="6" class="empty">No pull requests are waiting on your review.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
   </section>
 </div>

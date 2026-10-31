@@ -173,6 +173,7 @@ struct SummaryTemplate<'a> {
     discussions: &'a [db::DiscussionItem],
     reviews: &'a [db::ReviewRequestItem],
     recent_days: u64,
+    has_discussion_projects: bool,
 }
 
 /// Maximum rows shown per Summary thread section. The tables scroll, showing
@@ -194,6 +195,7 @@ pub fn render_summary(db: &Database, workspace: &Workspace, config: &Config) -> 
         discussions: &discussions,
         reviews: &reviews,
         recent_days,
+        has_discussion_projects: !config.discussions.projects.is_empty(),
     };
     template.render().context("rendering summary view")
 }
@@ -762,8 +764,30 @@ mod tests {
         let html = render_summary(&db, &ws, &Config::default()).expect("render");
         assert!(html.contains("No direct mentions need your attention."));
         assert!(html.contains("No unread CI failures."));
-        assert!(html.contains("No recent discussions."));
+        assert!(html.contains("No discussions configured."));
+        assert!(html.contains("Add projects in Settings"));
         assert!(html.contains("No pull requests are waiting on your review."));
+    }
+
+    #[test]
+    fn summary_distinguishes_configured_but_empty_discussions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("db");
+        let ws = Workspace {
+            name: "w".into(),
+            ..Default::default()
+        };
+        let config = Config {
+            github: Default::default(),
+            discussions: crate::config::DiscussionsConfig {
+                projects: vec!["o/r".into()],
+                recent_days: 3,
+            },
+            workspaces: vec![],
+        };
+        let html = render_summary(&db, &ws, &config).expect("render");
+        assert!(html.contains("No recent discussions in the last 3 days."));
+        assert!(!html.contains("Add projects in Settings"));
     }
 
     #[test]
