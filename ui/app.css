@@ -206,9 +206,8 @@ body {
 }
 
 .main {
-  max-width: 1200px;
   margin: 1.25rem auto;
-  padding: 0 1.25rem;
+  padding: 0 0.625rem;
 }
 
 .filters {
