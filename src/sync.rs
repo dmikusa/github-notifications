@@ -834,8 +834,15 @@ async fn resolve_workflow_run(
 /// request a review from the authenticated user.
 const REVIEW_REQUEST_SEARCH: &str = "is:open is:pr review-requested:@me";
 
+/// The user's own open pull requests and issues, most recently updated first.
+const MY_PULL_REQUESTS_SEARCH: &str = "is:open is:pr author:@me";
+const MY_ISSUES_SEARCH: &str = "is:open is:issue author:@me";
+
 /// The Summary tab shows the most recent review requests only.
 const REVIEW_REQUEST_LIMIT: usize = 10;
+
+/// The Summary tab shows the most recent of the user's own PRs/issues.
+const MY_ITEM_LIMIT: usize = 10;
 
 /// How many discussions to fetch per project (newest activity first).
 const DISCUSSION_PAGE_SIZE: usize = 50;
@@ -877,8 +884,9 @@ query($q: String!, $first: Int!) {
 }
 "#;
 
-/// Refresh the Summary tab's global data: pull requests awaiting review and
-/// new discussions for the configured projects.
+/// Refresh the Summary tab's global data: pull requests awaiting review, the
+/// user's own open PRs and issues, and new discussions for the configured
+/// projects.
 ///
 /// This is best-effort. A missing scope, an unreachable discussion, or a
 /// failed search must not break the Queue/Inbox sync, so errors are logged and
@@ -892,6 +900,21 @@ async fn sync_summary(
     if let Err(e) = sync_review_requests(client, db, status).await {
         tracing::warn!("review request sync failed: {e}");
     }
+    if let Err(e) = sync_my_items(
+        client,
+        db,
+        status,
+        MY_PULL_REQUESTS_SEARCH,
+        crate::db::MY_PULL_REQUESTS,
+    )
+    .await
+    {
+        tracing::warn!("my pull request sync failed: {e}");
+    }
+    if let Err(e) = sync_my_items(client, db, status, MY_ISSUES_SEARCH, crate::db::MY_ISSUES).await
+    {
+        tracing::warn!("my issue sync failed: {e}");
+    }
     if let Err(e) = sync_discussions(client, db, status, config).await {
         tracing::warn!("discussions sync failed: {e}");
     }
@@ -903,11 +926,35 @@ async fn sync_review_requests(
     db: &Database,
     status: &Arc<Mutex<SyncStatus>>,
 ) -> Result<()> {
+    let items =
+        fetch_search_listing(client, status, REVIEW_REQUEST_SEARCH, REVIEW_REQUEST_LIMIT).await?;
+    db.replace_review_requests(&items)
+}
+
+/// Cache a snapshot of the user's own open pull requests or issues.
+async fn sync_my_items(
+    client: &Client,
+    db: &Database,
+    status: &Arc<Mutex<SyncStatus>>,
+    query: &str,
+    source: &str,
+) -> Result<()> {
+    let items = fetch_search_listing(client, status, query, MY_ITEM_LIMIT).await?;
+    db.replace_my_items(source, &items)
+}
+
+/// Run a search listing and map the newest `limit` results into cache rows.
+async fn fetch_search_listing(
+    client: &Client,
+    status: &Arc<Mutex<SyncStatus>>,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<crate::db::SearchResultItem>> {
     let response = client
         .get(
             "/search/issues",
             &[
-                ("q", REVIEW_REQUEST_SEARCH),
+                ("q", query),
                 ("sort", "updated"),
                 ("order", "desc"),
                 ("per_page", "10"),
@@ -918,20 +965,17 @@ async fn sync_review_requests(
     record_rate_limit(status, &response.headers);
 
     if response.status != axum::http::StatusCode::OK {
-        // Search can be unavailable (e.g. a token without the needed access);
-        // leave the previous snapshot in place rather than clearing it.
-        tracing::warn!("review-request search returned {}", response.status);
-        return Ok(());
+        anyhow::bail!("search for {query:?} returned {}", response.status);
     }
 
     let results: SearchResults =
-        serde_json::from_slice(&response.body).context("parsing review request search")?;
-    let mut items: Vec<crate::db::ReviewRequestItem> = results
+        serde_json::from_slice(&response.body).context("parsing search results")?;
+    let mut items: Vec<crate::db::SearchResultItem> = results
         .items
         .iter()
         .filter_map(|item| {
             let repo = item.repo_full_name()?;
-            Some(crate::db::ReviewRequestItem {
+            Some(crate::db::SearchResultItem {
                 repo,
                 number: item.number as i64,
                 title: item.title.clone(),
@@ -942,11 +986,10 @@ async fn sync_review_requests(
             })
         })
         .collect();
-    // Keep the ten most recently updated, even if the API ignores the sort.
+    // Keep the most recently updated, even if the API ignores the sort.
     items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    items.truncate(REVIEW_REQUEST_LIMIT);
-    db.replace_review_requests(&items)?;
-    Ok(())
+    items.truncate(limit);
+    Ok(items)
 }
 
 /// Cache recent discussions for every configured project. Discussions are
@@ -2268,6 +2311,30 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(",")
         );
+        let my_prs_body = format!(
+            r#"{{"items":[{}]}}"#,
+            (101..=103)
+                .map(|n| {
+                    format!(
+                        r#"{{"number":{n},"title":"my pr {n}","html_url":"https://github.com/o/r/pull/{n}","updated_at":"2026-09-{:02}T00:00:00Z","created_at":"2026-08-01T00:00:00Z","user":{{"login":"me"}},"repository_url":"https://api.github.com/repos/o/r"}}"#,
+                        n - 100
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let my_issues_body = format!(
+            r#"{{"items":[{}]}}"#,
+            (201..=202)
+                .map(|n| {
+                    format!(
+                        r#"{{"number":{n},"title":"my issue {n}","html_url":"https://github.com/o/r/issues/{n}","updated_at":"2026-09-{:02}T00:00:00Z","created_at":"2026-08-01T00:00:00Z","user":{{"login":"me"}},"repository_url":"https://api.github.com/repos/o/r"}}"#,
+                        n - 198
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        );
         let discussion_updated = now_utc();
         let repository_graphql_body = serde_json::json!({
             "data": {
@@ -2308,8 +2375,15 @@ mod tests {
         let app = Router::new()
             .route(
                 "/search/issues",
-                get(move || {
-                    let body = search_body.clone();
+                get(move |axum::extract::RawQuery(q): axum::extract::RawQuery| {
+                    let q = q.unwrap_or_default();
+                    let body = if q.contains("review-requested") {
+                        search_body.clone()
+                    } else if q.contains("issue") {
+                        my_issues_body.clone()
+                    } else {
+                        my_prs_body.clone()
+                    };
                     async move { ([("ETag", "\"s1\"")], body) }
                 }),
             )
@@ -2352,6 +2426,24 @@ mod tests {
         sync_review_requests(&client, &db, &status)
             .await
             .expect("review requests");
+        sync_my_items(
+            &client,
+            &db,
+            &status,
+            MY_PULL_REQUESTS_SEARCH,
+            crate::db::MY_PULL_REQUESTS,
+        )
+        .await
+        .expect("my pull requests");
+        sync_my_items(
+            &client,
+            &db,
+            &status,
+            MY_ISSUES_SEARCH,
+            crate::db::MY_ISSUES,
+        )
+        .await
+        .expect("my issues");
         sync_discussions(&client, &db, &status, &config)
             .await
             .expect("discussions");
@@ -2359,6 +2451,19 @@ mod tests {
         let reviews = db.list_review_requests(10).expect("reviews");
         assert_eq!(reviews.len(), 10, "only the top 10 are kept");
         assert_eq!(reviews[0].number, 12, "most recently updated first");
+
+        let my_prs = db
+            .list_my_items(crate::db::MY_PULL_REQUESTS, 10)
+            .expect("my prs");
+        assert_eq!(my_prs.len(), 3);
+        assert_eq!(my_prs[0].number, 103, "most recently updated first");
+        assert_eq!(my_prs[0].title, "my pr 103");
+        let my_issues = db
+            .list_my_items(crate::db::MY_ISSUES, 10)
+            .expect("my issues");
+        assert_eq!(my_issues.len(), 2);
+        assert_eq!(my_issues[0].number, 202, "most recently updated first");
+        assert_eq!(my_issues[0].title, "my issue 202");
 
         let discussions = db
             .list_recent_discussions(&["o/r".into(), "o".into()], 7, 50)
@@ -2415,6 +2520,7 @@ mod tests {
 
         sync_summary(&client, &db, &status, &config).await;
         assert_eq!(db.count("review_requests").expect("reviews"), 0);
+        assert_eq!(db.count("my_items").expect("my items"), 0);
         assert_eq!(db.count("discussions").expect("discussions"), 0);
     }
 

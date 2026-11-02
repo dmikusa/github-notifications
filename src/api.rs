@@ -1211,6 +1211,8 @@ mod tests {
         assert!(body.contains("CI failures"));
         assert!(body.contains("Discussions"));
         assert!(body.contains("Review requests"));
+        assert!(body.contains("My PRs"));
+        assert!(body.contains("My Issues"));
         assert!(body.contains(r#"data-view="summary""#));
     }
 

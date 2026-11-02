@@ -194,4 +194,86 @@
       </table>
     </div>
   </section>
+
+  <section class="summary-section" data-section="my-prs">
+    <div class="section-head">
+      <h2 class="section-title">My PRs <span class="section-count">{{ my_prs.len() }}</span>
+        <span class="section-hint">up to 10 most recent</span>
+      </h2>
+      <div class="section-actions">
+        <span class="sel-count" data-sel-count="my-prs"></span>
+        <label class="section-select"><input type="checkbox" class="summary-sel-all" data-section="my-prs"> Select all</label>
+        <button class="icon-btn" data-summary-action="open" data-section="my-prs" title="Open selected in GitHub" disabled>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2H3a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-3"/><path d="M9.5 2h4.5v4.5"/><path d="M14 2 8 8"/></svg>
+        </button>
+      </div>
+    </div>
+    <div class="summary-scroll">
+      <table class="data">
+        <thead>
+          <tr>
+            <th class="chk"></th>
+            <th>Repo</th>
+            <th>#</th>
+            <th>Title</th>
+            <th>Updated</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in my_prs %}
+          <tr>
+            <td class="chk"><input type="checkbox" class="summary-sel" value="{{ item.html_url }}" data-html-url="{{ item.html_url }}"></td>
+            <td class="repo">{{ item.repo }}</td>
+            <td class="num">#{{ item.number }}</td>
+            <td class="title"><a href="{{ item.html_url }}" target="_blank" rel="noopener">{{ item.title }}</a></td>
+            <td class="time">{% if let Some(updated) = item.updated_at.as_deref() %}{{ updated }}{% endif %}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="5" class="empty">No open pull requests authored by you.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="summary-section" data-section="my-issues">
+    <div class="section-head">
+      <h2 class="section-title">My Issues <span class="section-count">{{ my_issues.len() }}</span>
+        <span class="section-hint">up to 10 most recent</span>
+      </h2>
+      <div class="section-actions">
+        <span class="sel-count" data-sel-count="my-issues"></span>
+        <label class="section-select"><input type="checkbox" class="summary-sel-all" data-section="my-issues"> Select all</label>
+        <button class="icon-btn" data-summary-action="open" data-section="my-issues" title="Open selected in GitHub" disabled>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2H3a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-3"/><path d="M9.5 2h4.5v4.5"/><path d="M14 2 8 8"/></svg>
+        </button>
+      </div>
+    </div>
+    <div class="summary-scroll">
+      <table class="data">
+        <thead>
+          <tr>
+            <th class="chk"></th>
+            <th>Repo</th>
+            <th>#</th>
+            <th>Title</th>
+            <th>Updated</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in my_issues %}
+          <tr>
+            <td class="chk"><input type="checkbox" class="summary-sel" value="{{ item.html_url }}" data-html-url="{{ item.html_url }}"></td>
+            <td class="repo">{{ item.repo }}</td>
+            <td class="num">#{{ item.number }}</td>
+            <td class="title"><a href="{{ item.html_url }}" target="_blank" rel="noopener">{{ item.title }}</a></td>
+            <td class="time">{% if let Some(updated) = item.updated_at.as_deref() %}{{ updated }}{% endif %}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="5" class="empty">No open issues authored by you.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
 </div>
