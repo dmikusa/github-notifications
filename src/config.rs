@@ -38,9 +38,10 @@ pub struct GithubConfig {
     pub repo_refresh_interval_seconds: u64,
     #[serde(default = "default_sync_concurrency")]
     pub sync_concurrency: u64,
-    /// When clearing closed/merged notifications, also sync with GitHub (re-check
-    /// each PR's state and mark dismissed threads read). Off by default so the
-    /// clear stays local and fast, using cached PR state.
+    /// When dismissing notifications (the Inbox/Summary dismiss action or the
+    /// closed/merged sweep), also sync with GitHub: unsubscribe from the
+    /// threads and mark dismissed PR threads read. Off by default so dismissing
+    /// stays local and fast.
     #[serde(default)]
     pub sync_dismiss_to_github: bool,
 }
@@ -271,11 +272,10 @@ repo_refresh_interval_seconds = 600
 # Must be between 1 and 10. Defaults to 6.
 sync_concurrency = 6
 
-# When clearing closed/merged notifications (the Inbox "Dismiss all
-# closed/merged" button, or a workspace's auto_dismiss_closed_merged), also
-# sync with GitHub: re-check each PR's state online and mark the dismissed
-# threads read there. Off by default, so clearing stays local and fast and
-# uses the PR state already cached from sync.
+# When dismissing notifications (Inbox/Summary "Dismiss", or the closed/merged
+# sweep and a workspace's auto_dismiss_closed_merged), also sync with GitHub:
+# unsubscribe from the threads and mark dismissed PR threads read there. Off
+# by default, so dismissing stays local and fast.
 sync_dismiss_to_github = false
 
 # GitHub Discussions projects shown on the Summary tab. This list is separate

@@ -311,6 +311,13 @@ CREATE TABLE IF NOT EXISTS threads (
 CREATE INDEX IF NOT EXISTS idx_threads_repo_subject
     ON threads (repo_id, subject_api_url);
 
+-- Locally dismissed notification threads. Kept out of the cache so a sync
+-- doesn't immediately re-add them; a newer updated_at clears the record.
+CREATE TABLE IF NOT EXISTS dismissed_threads (
+    thread_id  TEXT PRIMARY KEY,
+    updated_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS sync_state (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -1353,6 +1360,79 @@ CREATE TABLE IF NOT EXISTS review_requests (
         .context("looking up thread api_url")
     }
 
+    /// The last activity timestamp of a cached thread.
+    pub fn thread_updated_at(&self, thread_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.query_row(
+            "SELECT updated_at FROM threads WHERE thread_id = ?1",
+            params![thread_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(|o| o.flatten())
+        .context("looking up thread updated_at")
+    }
+
+    /// Remember locally dismissed threads so a notification sync doesn't
+    /// immediately re-add them. A newer thread timestamp allows them back in.
+    pub fn record_dismissed_threads(&self, items: &[(String, Option<String>)]) -> Result<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let mut stmt = conn
+            .prepare(
+                "INSERT INTO dismissed_threads (thread_id, updated_at) VALUES (?1, ?2)
+                 ON CONFLICT (thread_id) DO UPDATE SET updated_at = excluded.updated_at",
+            )
+            .context("preparing dismissed thread insert")?;
+        for (thread_id, updated_at) in items {
+            stmt.execute(params![thread_id, updated_at])
+                .context("recording dismissed thread")?;
+        }
+        Ok(())
+    }
+
+    /// Whether a thread is still covered by a local dismissal. A thread whose
+    /// activity is newer than the dismissal is no longer covered and its
+    /// dismissal record is removed so it can be re-added.
+    pub fn dismissed_thread_is_current(&self, thread_id: &str, updated_at: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let dismissed: Option<String> = conn
+            .query_row(
+                "SELECT updated_at FROM dismissed_threads WHERE thread_id = ?1",
+                params![thread_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("looking up dismissed thread")?
+            .flatten();
+        let Some(dismissed) = dismissed else {
+            return Ok(false);
+        };
+        let current: bool = conn
+            .query_row(
+                "SELECT COALESCE(datetime(?2) <= datetime(?1), 0)",
+                params![dismissed, updated_at],
+                |row| row.get(0),
+            )
+            .context("comparing dismissed thread time")?;
+        if !current {
+            conn.execute(
+                "DELETE FROM dismissed_threads WHERE thread_id = ?1",
+                params![thread_id],
+            )
+            .context("clearing stale dismissed thread")?;
+        }
+        Ok(current)
+    }
+
+    /// Delete all local dismissal records (used by tests).
+    #[cfg(test)]
+    pub fn clear_dismissed_threads(&self) -> Result<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        conn.execute("DELETE FROM dismissed_threads", [])
+            .context("clearing dismissed threads")?;
+        Ok(())
+    }
+
     /// Thread ids + API urls for threads whose subject matches an issue API
     /// url (used to mark a queue item's threads read).
     pub fn threads_for_subject(&self, subject_api_url: &str) -> Result<Vec<(String, String)>> {
@@ -1648,6 +1728,7 @@ mod tests {
             "sync_state",
             "discussions",
             "review_requests",
+            "dismissed_threads",
         ] {
             assert!(
                 tables.iter().any(|t| t == expected),
@@ -2331,6 +2412,30 @@ mod tests {
         let reviews = db.list_review_requests(10).expect("reviews");
         assert_eq!(reviews.len(), 1);
         assert_eq!(reviews[0].number, 2);
+    }
+
+    #[test]
+    fn dismissed_threads_are_cleared_by_new_activity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("open");
+        db.record_dismissed_threads(&[("1:thread".into(), Some("2026-01-01T00:00:00Z".into()))])
+            .expect("record");
+
+        // Same or older activity stays dismissed.
+        assert!(db
+            .dismissed_thread_is_current("1:thread", "2026-01-01T00:00:00Z")
+            .expect("same"));
+        assert!(db
+            .dismissed_thread_is_current("1:thread", "2025-12-31T00:00:00Z")
+            .expect("older"));
+
+        // Newer activity clears the dismissal so the thread can return.
+        assert!(!db
+            .dismissed_thread_is_current("1:thread", "2026-01-02T00:00:00Z")
+            .expect("newer"));
+        assert!(!db
+            .dismissed_thread_is_current("1:thread", "2026-01-01T00:00:00Z")
+            .expect("record was cleared"));
     }
 
     #[test]

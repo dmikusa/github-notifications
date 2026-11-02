@@ -9,6 +9,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -426,35 +427,71 @@ async fn issues_mark_read(
     json_response(result)
 }
 
+/// Max concurrent per-thread GitHub calls for bulk actions.
+const THREAD_ACTION_CONCURRENCY: usize = 6;
+
 #[derive(Deserialize)]
 struct ThreadsMuteBody {
     ids: Vec<String>,
 }
 
-/// Unsubscribe (dismiss) one or more notification threads, then drop them from
-/// the local cache so they disappear from the inbox.
+/// Dismiss one or more notification threads locally. When
+/// `sync_dismiss_to_github` is enabled, also unsubscribe from them on GitHub;
+/// otherwise no network calls are made and the dismissal is recorded locally
+/// so a sync doesn't immediately re-add the threads.
 async fn threads_mute(
     State(state): State<AppState>,
     Json(body): Json<ThreadsMuteBody>,
 ) -> Response {
     let result = async {
-        let mut count = 0usize;
+        let sync_to_github = state
+            .config
+            .read()
+            .expect("config lock poisoned")
+            .github
+            .sync_dismiss_to_github;
+
+        // Record the dismissal and delete locally first, so the fast path is
+        // pure SQLite and a failed GitHub call can't leave the batch half done.
+        let mut dismissed = Vec::new();
+        let mut targets = Vec::new();
         for id in &body.ids {
-            let Some(api_url) = state.db.thread_api_url(id)? else {
+            let Some(updated_at) = state.db.thread_updated_at(id)? else {
                 continue;
             };
-            let Some(numeric) = api_url.rsplit('/').next().map(str::to_string) else {
-                continue;
-            };
-            let res = state
-                .github
-                .delete(&format!("/notifications/threads/{numeric}/subscription"))
-                .await?;
-            ensure_success(&res.status, "dismiss thread")?;
-            count += 1;
+            if sync_to_github {
+                if let Some(api_url) = state.db.thread_api_url(id)? {
+                    if let Some(numeric) = api_url.rsplit('/').next() {
+                        targets.push(numeric.to_string());
+                    }
+                }
+            }
+            dismissed.push((id.clone(), Some(updated_at)));
         }
+        state.db.record_dismissed_threads(&dismissed)?;
         state.db.delete_threads(&body.ids)?;
-        Ok::<_, anyhow::Error>(count)
+
+        if sync_to_github {
+            let results: Vec<Result<(), anyhow::Error>> = stream::iter(targets)
+                .map(|numeric| {
+                    let client = state.github.clone();
+                    async move {
+                        let res = client
+                            .delete(&format!("/notifications/threads/{numeric}/subscription"))
+                            .await?;
+                        ensure_success(&res.status, "dismiss thread")
+                    }
+                })
+                .buffer_unordered(THREAD_ACTION_CONCURRENCY)
+                .collect()
+                .await;
+            for result in results {
+                if let Err(e) = result {
+                    tracing::warn!("dismiss thread on GitHub failed: {e}");
+                }
+            }
+        }
+        Ok::<_, anyhow::Error>(dismissed.len())
     }
     .await;
     if result.is_ok() {
@@ -917,29 +954,51 @@ async fn dismiss_closed_merged(State(state): State<AppState>) -> Response {
 
 /// Mark a set of threads read on GitHub and locally. Returns the count marked.
 async fn mark_threads_read(state: &AppState, thread_ids: &[String]) -> Result<usize> {
-    let mut count = 0;
+    let mut targets = Vec::new();
     for id in thread_ids {
         let Some(api_url) = state.db.thread_api_url(id)? else {
             continue;
         };
-        let Some(numeric) = api_url.rsplit('/').next().map(str::to_string) else {
+        let Some(numeric) = api_url.rsplit('/').next() else {
             continue;
         };
-        let res = state
-            .github
-            .patch(&format!("/notifications/threads/{numeric}"))
-            .await?;
-        if matches!(
-            res.status,
-            StatusCode::OK | StatusCode::NO_CONTENT | StatusCode::RESET_CONTENT
-        ) {
-            state
-                .db
-                .set_threads_unread(std::slice::from_ref(id), false)?;
-            count += 1;
+        targets.push((id.clone(), numeric.to_string()));
+    }
+
+    let results: Vec<Result<(String, bool), anyhow::Error>> = stream::iter(targets)
+        .map(|(id, numeric)| {
+            let client = state.github.clone();
+            async move {
+                let res = client
+                    .patch(&format!("/notifications/threads/{numeric}"))
+                    .await?;
+                let read = matches!(
+                    res.status,
+                    StatusCode::OK | StatusCode::NO_CONTENT | StatusCode::RESET_CONTENT
+                );
+                Ok((id, read))
+            }
+        })
+        .buffer_unordered(THREAD_ACTION_CONCURRENCY)
+        .collect()
+        .await;
+
+    let mut read_ids = Vec::new();
+    let mut first_error = None;
+    for result in results {
+        match result {
+            Ok((id, true)) => read_ids.push(id),
+            Ok((_, false)) => {}
+            Err(e) => first_error = Some(e),
         }
     }
-    Ok(count)
+    if !read_ids.is_empty() {
+        state.db.set_threads_unread(&read_ids, false)?;
+    }
+    if let Some(e) = first_error {
+        return Err(e);
+    }
+    Ok(read_ids.len())
 }
 
 fn ensure_success(status: &StatusCode, what: &str) -> Result<()> {
@@ -1486,7 +1545,147 @@ mod tests {
             .await
             .expect("dispatch");
         assert_eq!(response.status(), StatusCode::OK);
-        // The thread was unsubscribed on GitHub and dropped from the cache.
+        // The thread is dropped from the cache; no GitHub call was needed.
+        assert_eq!(db.count("threads").expect("count"), 0);
+        assert!(db
+            .dismissed_thread_is_current("1:111", "2026-01-01T00:00:00Z")
+            .expect("dismissed record"));
+    }
+
+    #[tokio::test]
+    async fn threads_mute_is_local_only_by_default() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Any GitHub request is a failure for the local-only path.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().fallback({
+            let calls = calls.clone();
+            move || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(Database::open(&dir.path().join("data.db")).expect("db"));
+        let thread = crate::models::NotificationThread {
+            id: "1:111".into(),
+            unread: true,
+            reason: "mention".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            last_read_at: None,
+            subject: crate::models::ThreadSubject {
+                title: "t".into(),
+                kind: "Issue".into(),
+                url: Some("https://api.github.com/repos/o/r/issues/3".into()),
+                latest_comment_url: None,
+            },
+            repository: Some(crate::models::ThreadRepository {
+                full_name: "o/r".into(),
+                html_url: "https://github.com/o/r".into(),
+            }),
+            url: format!("{base}/notifications/threads/111"),
+        };
+        db.upsert_thread(&thread).expect("thread");
+
+        let client = github::Client::with_base(Arc::new(ClassicPat::new("ghp_x".into())), &base);
+        let app = router(state_with_client(db.clone(), client));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/threads/mute")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"ids":["1:111"]}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "dismiss is local-only");
+        assert_eq!(db.count("threads").expect("count"), 0);
+    }
+
+    #[tokio::test]
+    async fn threads_mute_syncs_to_github_when_enabled() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/notifications/threads/111/subscription",
+            delete({
+                let calls = calls.clone();
+                move || {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(Database::open(&dir.path().join("data.db")).expect("db"));
+        let thread = crate::models::NotificationThread {
+            id: "1:111".into(),
+            unread: true,
+            reason: "mention".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            last_read_at: None,
+            subject: crate::models::ThreadSubject {
+                title: "t".into(),
+                kind: "Issue".into(),
+                url: Some("https://api.github.com/repos/o/r/issues/3".into()),
+                latest_comment_url: None,
+            },
+            repository: Some(crate::models::ThreadRepository {
+                full_name: "o/r".into(),
+                html_url: "https://github.com/o/r".into(),
+            }),
+            url: format!("{base}/notifications/threads/111"),
+        };
+        db.upsert_thread(&thread).expect("thread");
+
+        let client = github::Client::with_base(Arc::new(ClassicPat::new("ghp_x".into())), &base);
+        let state = state_with_client(db.clone(), client);
+        state
+            .config
+            .write()
+            .expect("lock")
+            .github
+            .sync_dismiss_to_github = true;
+        let app = router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/threads/mute")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"ids":["1:111"]}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(db.count("threads").expect("count"), 0);
     }
 

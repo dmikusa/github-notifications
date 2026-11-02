@@ -290,6 +290,11 @@ async fn sync_notifications(
             {
                 continue;
             }
+            // Locally dismissed threads stay hidden until they see new
+            // activity; a newer timestamp clears the dismissal.
+            if db.dismissed_thread_is_current(&thread.id, &thread.updated_at)? {
+                continue;
+            }
             db.upsert_thread(thread)?;
         }
 
@@ -2482,5 +2487,58 @@ mod tests {
             .await
             .expect("sync");
         assert_eq!(db.count("threads").expect("threads"), 0);
+    }
+
+    #[tokio::test]
+    async fn sync_notifications_keeps_locally_dismissed_threads_hidden() {
+        use axum::routing::get;
+        use axum::Router;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+
+        let payload = format!(
+            r#"[{{"id":"1:pr","unread":true,"reason":"mention",
+                 "updated_at":"2026-01-01T00:00:00Z","last_read_at":null,
+                 "subject":{{"title":"pr","type":"PullRequest","url":"{base}/repos/o/r/pulls/7","latest_comment_url":null}},
+                 "repository":{{"full_name":"o/r","html_url":"https://github.com/o/r"}},
+                 "url":"{base}/notifications/threads/7"}}]"#
+        );
+        let app = Router::new().route(
+            "/notifications",
+            get(move || async move { ([("ETag", "\"n1\"")], payload.clone()) }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("db");
+        let client = Client::with_base(
+            Arc::new(crate::auth::pat::ClassicPat::new("ghp_x".into())),
+            &base,
+        );
+        let status = Arc::new(Mutex::new(SyncStatus::default()));
+
+        // A local dismissal at the thread's current activity hides it.
+        db.record_dismissed_threads(&[("1:pr".into(), Some("2026-01-01T00:00:00Z".into()))])
+            .expect("record");
+        sync_notifications(&client, &db, &status)
+            .await
+            .expect("sync");
+        assert_eq!(db.count("threads").expect("threads"), 0);
+
+        // Newer activity than the dismissal brings the thread back.
+        db.record_dismissed_threads(&[("1:pr".into(), Some("2025-12-31T00:00:00Z".into()))])
+            .expect("record older");
+        sync_notifications(&client, &db, &status)
+            .await
+            .expect("sync again");
+        assert_eq!(db.count("threads").expect("threads"), 1);
+        assert!(!db
+            .dismissed_thread_is_current("1:pr", "2026-01-01T00:00:00Z")
+            .expect("cleared"));
     }
 }
