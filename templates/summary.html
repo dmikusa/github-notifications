@@ -1,0 +1,197 @@
+<div id="view" data-view="summary">
+  <section class="summary-section" data-section="mentions">
+    <div class="section-head">
+      <h2 class="section-title">Mentions <span class="section-count">{{ mentions.len() }}</span>
+        <span class="section-hint">up to 30 most recent</span>
+      </h2>
+      <div class="section-actions">
+        <span class="sel-count" data-sel-count="mentions"></span>
+        <label class="section-select"><input type="checkbox" class="summary-sel-all" data-section="mentions"> Select all</label>
+        <button class="icon-btn" data-summary-action="mark-read" data-section="mentions" title="Mark selected as read" disabled>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 8.5 5.5 12.5 14.5 3.5"/></svg>
+        </button>
+        <button class="icon-btn" data-summary-action="dismiss" data-section="mentions" title="Dismiss selected" disabled>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6.5c0 2-1 3-1 4.5h13c0-1.5-1-2.5-1-4.5a6.5 6.5 0 0 0-1.5-4.2"/><path d="M6.5 13a1.8 1.8 0 0 0 3 0"/><path d="M1.5 1.5l13 13"/></svg>
+        </button>
+        <button class="icon-btn" data-summary-action="open" data-section="mentions" title="Open selected in GitHub" disabled>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2H3a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-3"/><path d="M9.5 2h4.5v4.5"/><path d="M14 2 8 8"/></svg>
+        </button>
+      </div>
+    </div>
+    <div class="summary-scroll">
+      <table class="data">
+        <thead>
+          <tr>
+            <th class="chk"></th>
+            <th>Repo</th>
+            <th>#</th>
+            <th>Title</th>
+            <th>Author</th>
+            <th>Updated</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in mentions %}
+          <tr class="row-unread">
+            <td class="chk"><input type="checkbox" class="summary-sel" value="{{ item.thread_id }}"{% if let Some(url) = item.html_url.as_deref() %} data-html-url="{{ url }}"{% endif %}></td>
+            <td class="repo">{{ item.repo }}</td>
+            <td class="num">{% if let Some(n) = item.number.as_deref() %}#{{ n }}{% endif %}</td>
+            <td class="title">
+              {% if let Some(url) = item.html_url.as_deref() %}<a href="{{ url }}" target="_blank" rel="noopener">{{ item.title }}</a>
+              {% else %}{{ item.title }}{% endif %}
+            </td>
+            <td class="author">{% if let Some(author) = item.author.as_deref() %}{{ author }}{% endif %}</td>
+            <td class="time">{{ item.updated_at }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="6" class="empty">No direct mentions need your attention.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="summary-section" data-section="ci">
+    <div class="section-head">
+      <h2 class="section-title">CI failures <span class="section-count">{{ ci_failures.len() }}</span>
+        <span class="section-hint">up to 30 most recent</span>
+      </h2>
+      <div class="section-actions">
+        <span class="sel-count" data-sel-count="ci"></span>
+        <label class="section-select"><input type="checkbox" class="summary-sel-all" data-section="ci"> Select all</label>
+        <button class="icon-btn" data-summary-action="mark-read" data-section="ci" title="Mark selected as read" disabled>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 8.5 5.5 12.5 14.5 3.5"/></svg>
+        </button>
+        <button class="icon-btn" data-summary-action="dismiss" data-section="ci" title="Dismiss selected" disabled>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6.5c0 2-1 3-1 4.5h13c0-1.5-1-2.5-1-4.5a6.5 6.5 0 0 0-1.5-4.2"/><path d="M6.5 13a1.8 1.8 0 0 0 3 0"/><path d="M1.5 1.5l13 13"/></svg>
+        </button>
+        <button class="icon-btn" data-summary-action="open" data-section="ci" title="Open selected in GitHub" disabled>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2H3a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-3"/><path d="M9.5 2h4.5v4.5"/><path d="M14 2 8 8"/></svg>
+        </button>
+      </div>
+    </div>
+    <div class="summary-scroll">
+      <table class="data">
+        <thead>
+          <tr>
+            <th class="chk"></th>
+            <th>Repo</th>
+            <th>#</th>
+            <th>Title</th>
+            <th>Status</th>
+            <th>Updated</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in ci_failures %}
+          <tr class="row-unread">
+            <td class="chk"><input type="checkbox" class="summary-sel" value="{{ item.thread_id }}"{% if let Some(url) = item.html_url.as_deref() %} data-html-url="{{ url }}"{% endif %}></td>
+            <td class="repo">{{ item.repo }}</td>
+            <td class="num">{% if let Some(n) = item.number.as_deref() %}#{{ n }}{% endif %}</td>
+            <td class="title">
+              {% if let Some(url) = item.html_url.as_deref() %}<a href="{{ url }}" target="_blank" rel="noopener">{{ item.title }}</a>
+              {% else %}{{ item.title }}{% endif %}
+            </td>
+            <td class="status">
+              {% if let Some(state) = item.state.as_deref() %}
+              <span class="badge status-{{ state }}">{{ state }}</span>
+              {% endif %}
+            </td>
+            <td class="time">{{ item.updated_at }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="6" class="empty">No unread CI failures.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="summary-section" data-section="discussions">
+    <div class="section-head">
+      <h2 class="section-title">Discussions <span class="section-count">{{ discussions.len() }}</span>
+        <span class="section-hint">updated in the last {{ recent_days }} day{% if recent_days != 1 %}s{% endif %}</span>
+      </h2>
+      <div class="section-actions">
+        <span class="sel-count" data-sel-count="discussions"></span>
+        <label class="section-select"><input type="checkbox" class="summary-sel-all" data-section="discussions"> Select all</label>
+        <button class="icon-btn" data-summary-action="open" data-section="discussions" title="Open selected in GitHub" disabled>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2H3a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-3"/><path d="M9.5 2h4.5v4.5"/><path d="M14 2 8 8"/></svg>
+        </button>
+      </div>
+    </div>
+    <div class="summary-scroll">
+      <table class="data">
+        <thead>
+          <tr>
+            <th class="chk"></th>
+            <th>Repo</th>
+            <th>#</th>
+            <th>Title</th>
+            <th>Author</th>
+            <th>Category</th>
+            <th>Updated</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in discussions %}
+          <tr>
+            <td class="chk"><input type="checkbox" class="summary-sel" value="{{ item.url }}" data-html-url="{{ item.url }}"></td>
+            <td class="repo">{{ item.repo }}{% if !item.repo.contains('/') || item.repo.ends_with("/.github") %} <span class="badge">org</span>{% endif %}</td>
+            <td class="num">#{{ item.number }}</td>
+            <td class="title"><a href="{{ item.url }}" target="_blank" rel="noopener">{{ item.title }}</a></td>
+            <td class="author">{% if let Some(author) = item.author.as_deref() %}{{ author }}{% endif %}</td>
+            <td>{% if let Some(category) = item.category.as_deref() %}<span class="badge">{{ category }}</span>{% endif %}</td>
+            <td class="time">{% if let Some(updated) = item.updated_at.as_deref() %}{{ updated }}{% endif %}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="7" class="empty">{% if has_discussion_projects %}No recent discussions in the last {{ recent_days }} day{% if recent_days != 1 %}s{% endif %}.{% else %}No discussions configured. Add projects in Settings &rarr; Discussions.{% endif %}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="summary-section" data-section="reviews">
+    <div class="section-head">
+      <h2 class="section-title">Review requests <span class="section-count">{{ reviews.len() }}</span>
+        <span class="section-hint">up to 10 most recent</span>
+      </h2>
+      <div class="section-actions">
+        <span class="sel-count" data-sel-count="reviews"></span>
+        <label class="section-select"><input type="checkbox" class="summary-sel-all" data-section="reviews"> Select all</label>
+        <button class="icon-btn" data-summary-action="open" data-section="reviews" title="Open selected in GitHub" disabled>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2H3a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-3"/><path d="M9.5 2h4.5v4.5"/><path d="M14 2 8 8"/></svg>
+        </button>
+      </div>
+    </div>
+    <div class="summary-scroll">
+      <table class="data">
+        <thead>
+          <tr>
+            <th class="chk"></th>
+            <th>Repo</th>
+            <th>#</th>
+            <th>Title</th>
+            <th>Author</th>
+            <th>Updated</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in reviews %}
+          <tr>
+            <td class="chk"><input type="checkbox" class="summary-sel" value="{{ item.html_url }}" data-html-url="{{ item.html_url }}"></td>
+            <td class="repo">{{ item.repo }}</td>
+            <td class="num">#{{ item.number }}</td>
+            <td class="title"><a href="{{ item.html_url }}" target="_blank" rel="noopener">{{ item.title }}</a></td>
+            <td class="author">{% if let Some(author) = item.author.as_deref() %}{{ author }}{% endif %}</td>
+            <td class="time">{% if let Some(updated) = item.updated_at.as_deref() %}{{ updated }}{% endif %}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="6" class="empty">No pull requests are waiting on your review.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>

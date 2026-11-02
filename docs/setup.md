@@ -93,6 +93,8 @@ Notes:
 | `github.repo_refresh_interval_seconds` | `600` | Issue/PR refresh interval |
 | `github.sync_concurrency` | `6` | Concurrent GitHub requests per sync pass (1–10) |
 | `github.sync_dismiss_to_github` | `false` | Also sync closed/merged dismisses to GitHub (slower) |
+| `discussions.projects` | `[]` | `owner/repo` projects, or a bare `owner` for all org discussions (`owner/.github` is an alias), shown on the Summary tab |
+| `discussions.recent_days` | `7` | Show discussions updated within this many days |
 | `workspaces[].name` | — | Workspace display name |
 | `workspaces[].auto_dismiss_closed_merged` | `false` | Auto-mark closed+merged PR threads read |
 | `workspaces[].repo_sets[].name` | — | Repo set name |
@@ -111,6 +113,16 @@ poll_interval_seconds = 300
 repo_refresh_interval_seconds = 600
 sync_concurrency = 6
 sync_dismiss_to_github = false
+
+# Optional: projects whose Discussions show up on the Summary tab. This list
+# is independent of workspace repo sets. Use "owner/repo" for a repository, or
+# a bare "owner" for all discussions in an organization. Organization
+# discussions live in a source repo the org chooses (often .github or
+# feedback), so the app searches the whole organization; "owner/.github" is
+# accepted as an org-level alias.
+[discussions]
+projects = ["org1/repo-a", "org2"]
+recent_days = 7
 
 [[workspaces]]
 name = "Personal"

@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use anyhow::{Context, Result};
 use askama::Template;
 
-use crate::config::{Config, RepoSet, Workspace};
+use crate::config::{Config, DiscussionsConfig, RepoSet, Workspace};
 use crate::db::{self, Database};
 
 /// The workspace shown when the config has no workspaces yet.
@@ -166,6 +166,41 @@ fn author_options(names: Vec<String>, selected: &[String]) -> Vec<AuthorOption> 
 }
 
 #[derive(Template)]
+#[template(path = "summary.html")]
+struct SummaryTemplate<'a> {
+    mentions: &'a [db::SummaryThread],
+    ci_failures: &'a [db::SummaryThread],
+    discussions: &'a [db::DiscussionItem],
+    reviews: &'a [db::ReviewRequestItem],
+    recent_days: u64,
+    has_discussion_projects: bool,
+}
+
+/// Maximum rows shown per Summary thread section. The tables scroll, showing
+/// roughly ten at a time.
+const SUMMARY_THREAD_LIMIT: usize = 30;
+
+/// Render the Summary dashboard fragment for `workspace` and the global
+/// discussions config.
+pub fn render_summary(db: &Database, workspace: &Workspace, config: &Config) -> Result<String> {
+    let repos = workspace.tracked_repos();
+    let mentions = db.list_mentions(&repos, SUMMARY_THREAD_LIMIT)?;
+    let ci_failures = db.list_ci_failures(&repos, SUMMARY_THREAD_LIMIT)?;
+    let recent_days = config.discussions.effective_recent_days();
+    let discussions = db.list_recent_discussions(&config.discussions.projects, recent_days, 50)?;
+    let reviews = db.list_review_requests(10)?;
+    let template = SummaryTemplate {
+        mentions: &mentions,
+        ci_failures: &ci_failures,
+        discussions: &discussions,
+        reviews: &reviews,
+        recent_days,
+        has_discussion_projects: !config.discussions.projects.is_empty(),
+    };
+    template.render().context("rendering summary view")
+}
+
+#[derive(Template)]
 #[template(path = "repos.html")]
 struct ReposTemplate<'a> {
     ws: &'a str,
@@ -196,13 +231,18 @@ pub fn render_repos(db: &Database, workspace: &Workspace, q: &RepoParams) -> Res
 struct SettingsTemplate<'a> {
     ws: &'a str,
     repo_sets: &'a [RepoSet],
+    discussion_projects: &'a [String],
+    recent_days: u64,
 }
 
-/// Render the settings view fragment (repo set management) for `workspace`.
-pub fn render_settings(workspace: &Workspace) -> Result<String> {
+/// Render the settings view fragment (repo set and discussion project
+/// management) for `workspace`.
+pub fn render_settings(workspace: &Workspace, discussions: &DiscussionsConfig) -> Result<String> {
     let template = SettingsTemplate {
         ws: &workspace.name,
         repo_sets: &workspace.repo_sets,
+        discussion_projects: &discussions.projects,
+        recent_days: discussions.effective_recent_days(),
     };
     template.render().context("rendering settings view")
 }
@@ -234,6 +274,13 @@ pub struct InboxParams {
     pub sort: String,
     /// PR/issue authors to include, comma-separated.
     pub author: String,
+}
+
+/// Query params for the summary view.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct SummaryParams {
+    pub ws: String,
 }
 
 /// Split a comma-separated author param into a list.
@@ -584,13 +631,216 @@ mod tests {
     }
 
     #[test]
+    fn summary_renders_all_sections() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("db");
+        db.upsert_repo("o/r", Some("https://github.com/o/r"))
+            .expect("repo");
+
+        // A direct mention.
+        db.upsert_thread(&NotificationThread {
+            id: "1:mention".into(),
+            unread: true,
+            reason: "mention".into(),
+            updated_at: "2026-09-03T12:00:00Z".into(),
+            last_read_at: None,
+            subject: ThreadSubject {
+                title: "please look at this".into(),
+                kind: "Issue".into(),
+                url: Some("https://api.github.com/repos/o/r/issues/1".into()),
+                latest_comment_url: None,
+            },
+            repository: Some(ThreadRepository {
+                full_name: "o/r".into(),
+                html_url: "https://github.com/o/r".into(),
+            }),
+            url: "https://api.github.com/notifications/threads/1".into(),
+        })
+        .expect("mention");
+
+        // A failing CI check.
+        db.upsert_thread(&NotificationThread {
+            id: "2:ci".into(),
+            unread: true,
+            reason: "ci_activity".into(),
+            updated_at: "2026-09-03T13:00:00Z".into(),
+            last_read_at: None,
+            subject: ThreadSubject {
+                title: "Build workflow run failed".into(),
+                kind: "CheckSuite".into(),
+                url: None,
+                latest_comment_url: Some("https://api.github.com/repos/o/r/check-runs/9".into()),
+            },
+            repository: Some(ThreadRepository {
+                full_name: "o/r".into(),
+                html_url: "https://github.com/o/r".into(),
+            }),
+            url: "https://api.github.com/notifications/threads/2".into(),
+        })
+        .expect("ci");
+        db.set_subject_state(
+            "2:ci",
+            "failure",
+            Some("https://github.com/o/r/actions/runs/9"),
+            None,
+            "2026-09-03T13:05:00Z",
+        )
+        .expect("state");
+
+        let updated = crate::sync::now_utc();
+        db.replace_discussions(
+            "o/r",
+            &[db::DiscussionItem {
+                repo: "o/r".into(),
+                number: 4,
+                title: "a new discussion".into(),
+                url: "https://github.com/o/r/discussions/4".into(),
+                author: Some("bob".into()),
+                category: Some("General".into()),
+                created_at: Some(updated.clone()),
+                updated_at: Some(updated),
+            }],
+        )
+        .expect("discussions");
+        db.replace_review_requests(&[db::ReviewRequestItem {
+            repo: "o/r".into(),
+            number: 7,
+            title: "a pr needing review".into(),
+            author: Some("carol".into()),
+            html_url: "https://github.com/o/r/pull/7".into(),
+            created_at: Some("2026-08-01T00:00:00Z".into()),
+            updated_at: Some("2026-09-03T00:00:00Z".into()),
+        }])
+        .expect("reviews");
+
+        let ws = Workspace {
+            name: "w".into(),
+            repo_sets: vec![RepoSet {
+                name: "s".into(),
+                repos: vec!["o/r".into()],
+            }],
+            ..Default::default()
+        };
+        let config = Config {
+            github: Default::default(),
+            discussions: crate::config::DiscussionsConfig {
+                projects: vec!["o/r".into()],
+                recent_days: 7,
+            },
+            workspaces: vec![],
+        };
+        let html = render_summary(&db, &ws, &config).expect("render");
+
+        assert!(html.contains("Mentions"));
+        assert!(html.contains("please look at this"));
+        assert!(html.contains("CI failures"));
+        assert!(html.contains("Build workflow run failed"));
+        assert!(html.contains(r#"class="badge status-failure""#));
+        assert!(html.contains("Discussions"));
+        assert!(html.contains("a new discussion"));
+        assert!(html.contains("Review requests"));
+        assert!(html.contains("a pr needing review"));
+        // Mention and CI rows are selectable and each section has its own
+        // scoped select/dismiss/open controls.
+        assert!(html.contains("summary-sel"));
+        assert!(html.contains("summary-scroll"));
+        assert!(!html.contains("summary-bulk-bar"));
+        assert_eq!(html.matches(r#"class="summary-sel-all""#).count(), 4);
+        assert!(html.contains(r#"data-summary-action="dismiss" data-section="mentions""#));
+        assert!(html.contains(r#"data-summary-action="dismiss" data-section="ci""#));
+        assert!(html.contains(r#"data-summary-action="open" data-section="discussions""#));
+        assert!(html.contains(r#"data-summary-action="open" data-section="reviews""#));
+        assert!(html.contains("updated in the last 7 days"));
+    }
+
+    #[test]
+    fn summary_renders_empty_states() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("db");
+        let ws = Workspace {
+            name: "w".into(),
+            ..Default::default()
+        };
+        let html = render_summary(&db, &ws, &Config::default()).expect("render");
+        assert!(html.contains("No direct mentions need your attention."));
+        assert!(html.contains("No unread CI failures."));
+        assert!(html.contains("No discussions configured."));
+        assert!(html.contains("Add projects in Settings"));
+        assert!(html.contains("No pull requests are waiting on your review."));
+    }
+
+    #[test]
+    fn summary_distinguishes_configured_but_empty_discussions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("db");
+        let ws = Workspace {
+            name: "w".into(),
+            ..Default::default()
+        };
+        let config = Config {
+            github: Default::default(),
+            discussions: crate::config::DiscussionsConfig {
+                projects: vec!["o/r".into()],
+                recent_days: 3,
+            },
+            workspaces: vec![],
+        };
+        let html = render_summary(&db, &ws, &config).expect("render");
+        assert!(html.contains("No recent discussions in the last 3 days."));
+        assert!(!html.contains("Add projects in Settings"));
+    }
+
+    #[test]
+    fn summary_caps_mention_rows_at_thirty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("db");
+        db.upsert_repo("o/r", Some("https://github.com/o/r"))
+            .expect("repo");
+        for n in 1..=35u64 {
+            db.upsert_thread(&NotificationThread {
+                id: format!("{n}:mention"),
+                unread: true,
+                reason: "mention".into(),
+                updated_at: format!("2026-09-{:02}T12:00:00Z", (n % 28) + 1),
+                last_read_at: None,
+                subject: ThreadSubject {
+                    title: format!("mention {n}"),
+                    kind: "Issue".into(),
+                    url: Some(format!("https://api.github.com/repos/o/r/issues/{n}")),
+                    latest_comment_url: None,
+                },
+                repository: Some(ThreadRepository {
+                    full_name: "o/r".into(),
+                    html_url: "https://github.com/o/r".into(),
+                }),
+                url: format!("https://api.github.com/notifications/threads/{n}"),
+            })
+            .expect("mention");
+        }
+        let ws = Workspace {
+            name: "w".into(),
+            repo_sets: vec![RepoSet {
+                name: "s".into(),
+                repos: vec!["o/r".into()],
+            }],
+            ..Default::default()
+        };
+        let html = render_summary(&db, &ws, &Config::default()).expect("render");
+        assert_eq!(
+            html.matches(r#"class="summary-sel""#).count(),
+            SUMMARY_THREAD_LIMIT,
+            "long mention lists are capped"
+        );
+    }
+
+    #[test]
     fn settings_empty_state_renders_em_dash() {
         let ws = Workspace {
             name: "w".into(),
             repo_sets: vec![],
             ..Default::default()
         };
-        let html = render_settings(&ws).expect("render");
+        let html = render_settings(&ws, &DiscussionsConfig::default()).expect("render");
         // Regression: a literal `\u2014` in the template was rendered as text.
         assert!(!html.contains(r"\u2014"));
         assert!(html.contains("&mdash;"));

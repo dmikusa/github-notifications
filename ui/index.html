@@ -10,7 +10,8 @@
   <header class="topbar">
     <h1 class="brand">github-notifications</h1>
     <nav class="nav" id="tabs">
-      <button class="tab active" data-view="queue">Queue</button>
+      <button class="tab active" data-view="summary">Summary</button>
+      <button class="tab" data-view="queue">Queue</button>
       <button class="tab" data-view="inbox">Inbox</button>
       <button class="tab" data-view="repos">Repos</button>
       <button class="tab" data-view="settings">Settings</button>
@@ -29,7 +30,9 @@
   </div>
   <div id="notice" class="notice" hidden></div>
   <div id="flash" class="flash" hidden></div>
-  <main id="view" class="main"></main>
+  <main class="main">
+    <div id="view"></div>
+  </main>
 
   <dialog id="add-ws-dialog">
     <form id="add-ws-form">

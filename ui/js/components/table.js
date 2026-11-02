@@ -16,7 +16,9 @@ window.App.table = (() => {
   }
 
   function selected() {
-    return Array.from(document.querySelectorAll('#view .sel:checked')).map((cb) => cb.value);
+    return Array.from(
+      document.querySelectorAll('#view .sel:checked, #view .summary-sel:checked')
+    ).map((cb) => cb.value);
   }
 
   function selectedUrls() {
@@ -39,7 +41,7 @@ window.App.table = (() => {
     const root = document.querySelector('#view');
     if (!root) return;
     const bar = root.querySelector('.bulk-bar');
-    const count = root.querySelector('.sel-count');
+    const count = bar ? bar.querySelector('.sel-count') : null;
     const sel = selected();
     // The action buttons stay visible at all times so the layout never shifts;
     // they're just disabled until something is selected.

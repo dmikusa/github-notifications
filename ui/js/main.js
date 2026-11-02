@@ -103,6 +103,9 @@ let pollTimer = null;
 // visible view is repainted from cache even mid-sync, so the user sees fresh
 // rows as soon as a phase lands instead of waiting for the whole pass.
 let renderedRevision = null;
+// Monotonic id for status polls: a slow earlier poll must not overwrite a
+// newer result and leave the UI showing a stale `running: true`.
+let statusSeq = 0;
 
 function showLoading() {
   const el = document.getElementById('view');
@@ -138,19 +141,36 @@ async function onSyncStatus(status) {
 function restoreSelection(values) {
   if (!values || !values.length) return;
   const wanted = new Set(values);
-  document.querySelectorAll('#view .sel').forEach((cb) => {
+  document.querySelectorAll('#view .sel, #view .summary-sel').forEach((cb) => {
     if (wanted.has(cb.value)) cb.checked = true;
   });
   if (window.App.table.bind) window.App.table.bind();
+  if (window.App.views.summary && window.App.views.summary.update) {
+    window.App.views.summary.update();
+  }
 }
 
 async function syncStatusTick() {
+  const seq = ++statusSeq;
   try {
     const st = await window.App.api.getJSON('/api/sync/status');
+    // Drop out-of-order responses from an older poll.
+    if (seq !== statusSeq) return;
     await onSyncStatus(st);
   } catch (_) {
     /* daemon unreachable momentarily; try again next tick */
   }
+}
+
+/// Keep polling sync status forever. The next poll is scheduled before the
+/// current one runs, so a slow request or view load can never stop the loop.
+function startStatusPolling() {
+  if (pollTimer) return;
+  const tick = async () => {
+    pollTimer = setTimeout(tick, 2000);
+    await syncStatusTick();
+  };
+  pollTimer = setTimeout(tick, 2000);
 }
 
 function populateWorkspaces(state) {
@@ -230,6 +250,9 @@ async function refreshStatusLine() {
 }
 
 (async () => {
+  // Start polling first: the spinner and view must keep updating even if the
+  // rest of the initial setup (workspace list, auth line) is slow or fails.
+  startStatusPolling();
   try {
     const state = await window.App.api.getState();
     populateWorkspaces(state);
@@ -354,11 +377,9 @@ async function refreshStatusLine() {
     if (!status.populated) {
       showLoading();
     }
-    // Continuous sync-status awareness: drives the spinner next to "last sync"
-    // whenever a pass runs, keeps the timestamp fresh, and loads the initial
-    // view once the first sync completes.
+    // Load the view (and current status) right away; the continuous poller
+    // started above keeps it fresh afterwards.
     await syncStatusTick();
-    pollTimer = setInterval(syncStatusTick, 2000);
   } catch (err) {
     window.App.status.set(`Failed to reach the daemon: ${err.message}`, true);
   }

@@ -18,6 +18,7 @@ pub const JS_BUNDLE: &[&str] = &[
     "js/components/table.js",
     "js/components/filters.js",
     "js/views/queue.js",
+    "js/views/summary.js",
     "js/views/inbox.js",
     "js/views/repos.js",
     "js/views/settings.js",

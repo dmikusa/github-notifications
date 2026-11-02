@@ -50,6 +50,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sync", post(sync_handler))
         .route("/api/sync/status", get(sync_status_handler))
         .route("/api/views/queue", get(queue_view))
+        .route("/api/views/summary", get(summary_view))
         .route("/api/views/inbox", get(inbox_view))
         .route("/api/views/repos", get(repos_view))
         .route("/api/views/settings", get(settings_view))
@@ -73,13 +74,35 @@ pub fn router(state: AppState) -> Router {
         .route("/api/orgs/{org}/repos", get(org_repos))
         .route("/api/workspaces", post(workspace_create))
         .route("/api/workspaces/{name}/activate", post(workspace_activate))
+        .route("/api/discussions/projects", post(discussion_project_add))
+        .route(
+            "/api/discussions/projects/{project}",
+            delete(discussion_project_remove),
+        )
+        .route("/api/discussions/settings", post(discussion_settings))
         .route(
             "/api/notifications/dismiss-closed-merged",
             post(dismiss_closed_merged),
         )
         .fallback(static_handler)
         .layer(axum::middleware::from_fn(log_requests))
+        .layer(axum::middleware::from_fn(no_store_api))
         .with_state(state)
+}
+
+/// Mark `/api/*` responses as uncacheable. Without this, a browser can serve a
+/// stale sync status (e.g. `running: true`) and leave the UI spinner stuck even
+/// after the pass has finished. Static assets are left cacheable.
+async fn no_store_api(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let is_api = request.uri().path().starts_with("/api/");
+    let mut response = next.run(request).await;
+    if is_api {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    }
+    response
 }
 
 /// Debug-level access log for incoming HTTP requests: method, path, status,
@@ -250,6 +273,18 @@ async fn queue_view(
     }
 }
 
+async fn summary_view(
+    State(state): State<AppState>,
+    Query(params): Query<views::SummaryParams>,
+) -> Response {
+    let config = state.config.read().expect("config lock poisoned");
+    let ws = views::resolve_workspace(&config, &params.ws);
+    match views::render_summary(&state.db, ws, &config) {
+        Ok(html) => html_response(html),
+        Err(e) => json_response(Err::<(), _>(e)),
+    }
+}
+
 async fn inbox_view(
     State(state): State<AppState>,
     Query(params): Query<views::InboxParams>,
@@ -280,7 +315,7 @@ async fn settings_view(
 ) -> Response {
     let config = state.config.read().expect("config lock poisoned");
     let ws = views::resolve_workspace(&config, &params.ws);
-    match views::render_settings(ws) {
+    match views::render_settings(ws, &config.discussions) {
         Ok(html) => html_response(html),
         Err(e) => json_response(Err::<(), _>(e)),
     }
@@ -310,16 +345,14 @@ async fn sync_status_handler(State(state): State<AppState>) -> Response {
         .lock()
         .expect("sync status poisoned")
         .clone();
-    let populated = status.last_sync.is_some()
-        || state
-            .db
-            .get_sync_state("last_sync")
-            .map(|v| v.is_some())
-            .unwrap_or(false);
+    // Fall back to the stored timestamp while the first pass after a daemon
+    // restart is still running, so the UI can keep showing the last sync time.
+    let last_sync_db = state.db.get_sync_state("last_sync").unwrap_or_default();
+    let populated = status.last_sync.is_some() || last_sync_db.is_some();
     let response = SyncStatusResponse {
         populated,
         running: status.running,
-        last_sync: status.last_sync,
+        last_sync: status.last_sync.or(last_sync_db),
         last_error: status.last_error,
         rebuild: state.db.get_sync_state("last_rebuild").unwrap_or_default(),
         dismiss_running: status.dismiss_running,
@@ -597,6 +630,69 @@ async fn repo_delete(
 ) -> Response {
     let result = async {
         config::remove_repo(&state.config_path, &name, &set, &repo)?;
+        reload_config(&state)?;
+        let _ = state.sync_trigger.send(()).await;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if result.is_ok() {
+        crate::sync::bump_data_revision(&state.sync_status);
+    }
+    json_response(result)
+}
+
+#[derive(Deserialize)]
+struct DiscussionProjectBody {
+    project: String,
+}
+
+/// Add a discussion project (`owner/repo` or a bare `owner` for org-level
+/// discussions) to the config and refresh the Summary data.
+async fn discussion_project_add(
+    State(state): State<AppState>,
+    Json(body): Json<DiscussionProjectBody>,
+) -> Response {
+    let result = async {
+        config::add_discussion_project(&state.config_path, &body.project)?;
+        reload_config(&state)?;
+        let _ = state.sync_trigger.send(()).await;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if result.is_ok() {
+        crate::sync::bump_data_revision(&state.sync_status);
+    }
+    json_response(result)
+}
+
+async fn discussion_project_remove(
+    State(state): State<AppState>,
+    Path(project): Path<String>,
+) -> Response {
+    let result = async {
+        config::remove_discussion_project(&state.config_path, &project)?;
+        reload_config(&state)?;
+        let _ = state.sync_trigger.send(()).await;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if result.is_ok() {
+        crate::sync::bump_data_revision(&state.sync_status);
+    }
+    json_response(result)
+}
+
+#[derive(Deserialize)]
+struct DiscussionSettingsBody {
+    recent_days: u64,
+}
+
+async fn discussion_settings(
+    State(state): State<AppState>,
+    Json(body): Json<DiscussionSettingsBody>,
+) -> Response {
+    let result = async {
+        config::set_discussion_recent_days(&state.config_path, body.recent_days)?;
         reload_config(&state)?;
         let _ = state.sync_trigger.send(()).await;
         Ok::<_, anyhow::Error>(())
@@ -895,6 +991,7 @@ mod tests {
                 auth_token: "ghp_test".into(),
                 ..Default::default()
             },
+            discussions: Default::default(),
             workspaces: vec![Workspace {
                 name: "personal".into(),
                 auto_dismiss_closed_merged: false,
@@ -959,6 +1056,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_responses_are_not_cached() {
+        let app = router(test_state());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/sync/status")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_status_falls_back_to_the_stored_last_sync() {
+        let state = test_state();
+        state
+            .db
+            .set_sync_state("last_sync", "2026-01-01T00:00:00Z")
+            .expect("set last sync");
+        let app = router(state);
+        let (status, body) = get_body(app, "/api/sync/status").await;
+        assert_eq!(status, StatusCode::OK);
+        let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["last_sync"], "2026-01-01T00:00:00Z");
+        assert_eq!(value["populated"], true);
+    }
+
+    #[tokio::test]
     async fn sync_endpoint_accepts_request() {
         let app = router(test_state());
         let response = app
@@ -1010,6 +1144,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn summary_view_renders_all_sections() {
+        let app = router(test_state());
+        let (status, body) = get_body(app, "/api/views/summary?ws=personal").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("Mentions"));
+        assert!(body.contains("CI failures"));
+        assert!(body.contains("Discussions"));
+        assert!(body.contains("Review requests"));
+        assert!(body.contains(r#"data-view="summary""#));
+    }
+
+    #[tokio::test]
     async fn inbox_view_renders_filter_form() {
         let app = router(test_state());
         let (status, body) = get_body(app, "/api/views/inbox?ws=personal&unread=true").await;
@@ -1027,6 +1173,7 @@ mod tests {
                 auth_token: "ghp_test".into(),
                 ..Default::default()
             },
+            discussions: Default::default(),
             workspaces: vec![Workspace {
                 name: "personal".into(),
                 auto_dismiss_closed_merged: false,
@@ -1535,6 +1682,112 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let cfg = state.config.read().expect("lock");
         assert!(cfg.workspaces[0].repo_sets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn discussion_endpoints_update_config() {
+        let (state, _dir) = state_with_config_file(
+            "[github]\nauth_provider = \"gh-token\"\n\n[[workspaces]]\nname = \"personal\"\n",
+        );
+        let app = router(state.clone());
+
+        let post = |uri: &str, body: &str| {
+            let app = app.clone();
+            let uri = uri.to_string();
+            let body = body.to_string();
+            async move {
+                app.oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(&uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .expect("request"),
+                )
+                .await
+                .expect("dispatch")
+            }
+        };
+
+        // Add a repo project and an org-level project.
+        let response = post("/api/discussions/projects", r#"{"project":"cli/cli"}"#).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = post(
+            "/api/discussions/projects",
+            r#"{"project":"paketo-buildpacks"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        {
+            let cfg = state.config.read().expect("lock");
+            assert_eq!(
+                cfg.discussions.projects,
+                vec!["cli/cli".to_string(), "paketo-buildpacks".to_string()]
+            );
+        }
+        let raw = std::fs::read_to_string(&state.config_path).expect("read config");
+        assert!(raw.contains("cli/cli"));
+        assert!(raw.contains("paketo-buildpacks"));
+
+        // Recent window write-back (clamped to at least one day).
+        let response = post("/api/discussions/settings", r#"{"recent_days":14}"#).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            state.config.read().expect("lock").discussions.recent_days,
+            14
+        );
+
+        // Remove both, including the slash-containing project id.
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/api/discussions/projects/cli%2Fcli")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/api/discussions/projects/paketo-buildpacks")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state
+            .config
+            .read()
+            .expect("lock")
+            .discussions
+            .projects
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn settings_view_renders_discussion_projects() {
+        let state = test_state();
+        {
+            let mut cfg = state.config.write().expect("lock");
+            cfg.discussions.projects = vec!["cli/cli".into(), "paketo-buildpacks".into()];
+            cfg.discussions.recent_days = 14;
+        }
+        let app = router(state);
+        let (status, body) = get_body(app, "/api/views/settings?ws=personal").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("data-settings-tab=\"discussions\""));
+        assert!(body.contains("remove-discussion-project"));
+        assert!(body.contains("cli/cli"));
+        assert!(body.contains("paketo-buildpacks"));
+        assert!(body.contains("Organization discussions (all repositories)"));
+        assert!(body.contains("value=\"14\""));
     }
 
     #[tokio::test]

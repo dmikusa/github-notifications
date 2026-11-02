@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::http::StatusCode;
 use reqwest::header::{
@@ -18,6 +19,14 @@ const API_VERSION: &str = "2022-11-28";
 
 /// How many times to retry a request that GitHub rate limited before giving up.
 const MAX_RATE_RETRIES: u32 = 3;
+
+/// How long a single GitHub request may take before it is aborted. Without
+/// this, a stalled connection leaves a sync pass "running" forever and the UI
+/// spinner never clears.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long to wait for the TCP/TLS connection to GitHub.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Whether a response is a rate-limit rejection we should back off and retry.
 ///
@@ -49,9 +58,7 @@ fn is_rate_limited(status: StatusCode, headers: &HeaderMap, body: &[u8]) -> bool
 /// when present, otherwise exponential backoff (1s, 2s, 4s...). Capped so a
 /// sync can't hang for long; a 403 with a `x-ratelimit-reset` uses that only
 /// when it is a short wait.
-fn retry_delay(headers: &HeaderMap, attempt: u32) -> std::time::Duration {
-    use std::time::Duration;
-
+fn retry_delay(headers: &HeaderMap, attempt: u32) -> Duration {
     if let Some(secs) = headers
         .get("retry-after")
         .and_then(|v| v.to_str().ok())
@@ -120,6 +127,8 @@ impl Client {
         );
         let http = reqwest::Client::builder()
             .default_headers(headers)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .expect("building http client");
         Self {
@@ -150,6 +159,7 @@ impl Client {
             let mut builder = match method {
                 "GET" => self.http.get(url),
                 "PATCH" => self.http.patch(url),
+                "POST" => self.http.post(url),
                 "PUT" => self.http.put(url),
                 "DELETE" => self.http.delete(url),
                 _ => {
@@ -265,6 +275,32 @@ impl Client {
             &[],
             None,
             Some(body.to_string()),
+        )
+        .await
+    }
+
+    /// Authenticated `POST` with a JSON body (e.g. a GraphQL query).
+    pub async fn post_json(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<GitResponse, ClientError> {
+        self.request(
+            "POST",
+            &format!("{}{}", self.base, path),
+            &[],
+            None,
+            Some(body.to_string()),
+        )
+        .await
+    }
+
+    /// Run a GraphQL query, returning the raw response so callers can inspect
+    /// the `data`/`errors` body and the rate-limit headers.
+    pub async fn graphql(&self, query: &str, variables: Value) -> Result<GitResponse, ClientError> {
+        self.post_json(
+            "/graphql",
+            serde_json::json!({ "query": query, "variables": variables }),
         )
         .await
     }
@@ -626,5 +662,36 @@ mod tests {
         let v = client.validate().await.expect("validate");
         assert!(v.ok, "the client should retry past the rate limit");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn graphql_posts_the_query_and_returns_the_body() {
+        use axum::extract::Json as AxumJson;
+        use axum::routing::post;
+        use serde_json::json;
+
+        let app = Router::new().route(
+            "/graphql",
+            post(|AxumJson(body): AxumJson<serde_json::Value>| async move {
+                assert_eq!(body["query"], "query { viewer { login } }");
+                assert_eq!(body["variables"]["first"], 5);
+                axum::Json(json!({"data": {"viewer": {"login": "octocat"}}}))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let base = format!("http://{addr}");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let client = Client::with_base(Arc::new(ClassicPat::new("ghp_x".into())), &base);
+        let response = client
+            .graphql("query { viewer { login } }", json!({ "first": 5 }))
+            .await
+            .expect("graphql");
+        assert_eq!(response.status, StatusCode::OK);
+        let body: Value = serde_json::from_slice(&response.body).expect("json");
+        assert_eq!(body["data"]["viewer"]["login"], "octocat");
     }
 }
