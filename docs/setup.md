@@ -92,7 +92,7 @@ Notes:
 | `github.poll_interval_seconds` | `300` | Notification poll interval |
 | `github.repo_refresh_interval_seconds` | `600` | Issue/PR refresh interval |
 | `github.sync_concurrency` | `6` | Concurrent GitHub requests per sync pass (1–10) |
-| `github.sync_dismiss_to_github` | `false` | Also sync closed/merged dismisses to GitHub (slower) |
+| `github.sync_dismiss_to_github` | `false` | Also unsubscribe/mark read dismissed threads on GitHub (slower); off means dismiss is local-only |
 | `discussions.projects` | `[]` | `owner/repo` projects, or a bare `owner` for all org discussions (`owner/.github` is an alias), shown on the Summary tab |
 | `discussions.recent_days` | `7` | Show discussions updated within this many days |
 | `workspaces[].name` | — | Workspace display name |
