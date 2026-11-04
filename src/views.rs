@@ -171,7 +171,9 @@ struct SummaryTemplate<'a> {
     mentions: &'a [db::SummaryThread],
     ci_failures: &'a [db::SummaryThread],
     discussions: &'a [db::DiscussionItem],
-    reviews: &'a [db::ReviewRequestItem],
+    reviews: &'a [db::SearchResultItem],
+    my_prs: &'a [db::SearchResultItem],
+    my_issues: &'a [db::SearchResultItem],
     recent_days: u64,
     has_discussion_projects: bool,
 }
@@ -189,11 +191,15 @@ pub fn render_summary(db: &Database, workspace: &Workspace, config: &Config) -> 
     let recent_days = config.discussions.effective_recent_days();
     let discussions = db.list_recent_discussions(&config.discussions.projects, recent_days, 50)?;
     let reviews = db.list_review_requests(10)?;
+    let my_prs = db.list_my_items(db::MY_PULL_REQUESTS, 10)?;
+    let my_issues = db.list_my_items(db::MY_ISSUES, 10)?;
     let template = SummaryTemplate {
         mentions: &mentions,
         ci_failures: &ci_failures,
         discussions: &discussions,
         reviews: &reviews,
+        my_prs: &my_prs,
+        my_issues: &my_issues,
         recent_days,
         has_discussion_projects: !config.discussions.projects.is_empty(),
     };
@@ -702,7 +708,7 @@ mod tests {
             }],
         )
         .expect("discussions");
-        db.replace_review_requests(&[db::ReviewRequestItem {
+        db.replace_review_requests(&[db::SearchResultItem {
             repo: "o/r".into(),
             number: 7,
             title: "a pr needing review".into(),
@@ -712,6 +718,32 @@ mod tests {
             updated_at: Some("2026-09-03T00:00:00Z".into()),
         }])
         .expect("reviews");
+        db.replace_my_items(
+            db::MY_PULL_REQUESTS,
+            &[db::SearchResultItem {
+                repo: "o/r".into(),
+                number: 8,
+                title: "my open pr".into(),
+                author: Some("me".into()),
+                html_url: "https://github.com/o/r/pull/8".into(),
+                created_at: Some("2026-08-01T00:00:00Z".into()),
+                updated_at: Some("2026-09-04T00:00:00Z".into()),
+            }],
+        )
+        .expect("my prs");
+        db.replace_my_items(
+            db::MY_ISSUES,
+            &[db::SearchResultItem {
+                repo: "o/r".into(),
+                number: 9,
+                title: "my open issue".into(),
+                author: Some("me".into()),
+                html_url: "https://github.com/o/r/issues/9".into(),
+                created_at: Some("2026-08-01T00:00:00Z".into()),
+                updated_at: Some("2026-09-05T00:00:00Z".into()),
+            }],
+        )
+        .expect("my issues");
 
         let ws = Workspace {
             name: "w".into(),
@@ -740,16 +772,22 @@ mod tests {
         assert!(html.contains("a new discussion"));
         assert!(html.contains("Review requests"));
         assert!(html.contains("a pr needing review"));
+        assert!(html.contains("My PRs"));
+        assert!(html.contains("my open pr"));
+        assert!(html.contains("My Issues"));
+        assert!(html.contains("my open issue"));
         // Mention and CI rows are selectable and each section has its own
         // scoped select/dismiss/open controls.
         assert!(html.contains("summary-sel"));
         assert!(html.contains("summary-scroll"));
         assert!(!html.contains("summary-bulk-bar"));
-        assert_eq!(html.matches(r#"class="summary-sel-all""#).count(), 4);
+        assert_eq!(html.matches(r#"class="summary-sel-all""#).count(), 6);
         assert!(html.contains(r#"data-summary-action="dismiss" data-section="mentions""#));
         assert!(html.contains(r#"data-summary-action="dismiss" data-section="ci""#));
         assert!(html.contains(r#"data-summary-action="open" data-section="discussions""#));
         assert!(html.contains(r#"data-summary-action="open" data-section="reviews""#));
+        assert!(html.contains(r#"data-summary-action="open" data-section="my-prs""#));
+        assert!(html.contains(r#"data-summary-action="open" data-section="my-issues""#));
         assert!(html.contains("updated in the last 7 days"));
     }
 
@@ -767,6 +805,8 @@ mod tests {
         assert!(html.contains("No discussions configured."));
         assert!(html.contains("Add projects in Settings"));
         assert!(html.contains("No pull requests are waiting on your review."));
+        assert!(html.contains("No open pull requests authored by you."));
+        assert!(html.contains("No open issues authored by you."));
     }
 
     #[test]

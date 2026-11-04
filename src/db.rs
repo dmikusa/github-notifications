@@ -176,9 +176,10 @@ pub struct DiscussionItem {
     pub updated_at: Option<String>,
 }
 
-/// One pull request awaiting review (`review-requested:@me` search result).
+/// One item from a GitHub search listing: review requests, my pull requests,
+/// or my issues.
 #[derive(Debug, Clone)]
-pub struct ReviewRequestItem {
+pub struct SearchResultItem {
     pub repo: String,
     pub number: i64,
     pub title: String,
@@ -190,6 +191,10 @@ pub struct ReviewRequestItem {
 
 /// Check-run conclusions that count as a CI failure worth surfacing.
 pub const CI_FAILURE_STATES: &[&str] = &["failure", "timed_out", "startup_failure"];
+
+/// Sources stored in the `my_items` table.
+pub const MY_PULL_REQUESTS: &str = "my_pull_request";
+pub const MY_ISSUES: &str = "my_issue";
 
 /// Current schema version. Bump whenever the SQLite schema changes; the
 /// database is rebuilt (backed up and recreated) on mismatch.
@@ -356,6 +361,18 @@ CREATE TABLE IF NOT EXISTS review_requests (
     created_at TEXT,
     updated_at TEXT,
     UNIQUE (repo, number)
+);
+
+CREATE TABLE IF NOT EXISTS my_items (
+    source     TEXT NOT NULL,
+    repo       TEXT NOT NULL,
+    number     INTEGER NOT NULL,
+    title      TEXT NOT NULL,
+    author     TEXT,
+    html_url   TEXT NOT NULL,
+    created_at TEXT,
+    updated_at TEXT,
+    PRIMARY KEY (source, repo, number)
 );
 "#,
         )
@@ -1229,7 +1246,7 @@ CREATE TABLE IF NOT EXISTS review_requests (
     }
 
     /// Replace the cached "pull requests awaiting my review" snapshot.
-    pub fn replace_review_requests(&self, items: &[ReviewRequestItem]) -> Result<()> {
+    pub fn replace_review_requests(&self, items: &[SearchResultItem]) -> Result<()> {
         let conn = self.conn.lock().expect("db lock poisoned");
         let tx = conn
             .unchecked_transaction()
@@ -1261,7 +1278,7 @@ CREATE TABLE IF NOT EXISTS review_requests (
     }
 
     /// Pull requests awaiting review, most recently updated first.
-    pub fn list_review_requests(&self, limit: usize) -> Result<Vec<ReviewRequestItem>> {
+    pub fn list_review_requests(&self, limit: usize) -> Result<Vec<SearchResultItem>> {
         let conn = self.conn.lock().expect("db lock poisoned");
         let mut stmt = conn
             .prepare(
@@ -1272,7 +1289,7 @@ CREATE TABLE IF NOT EXISTS review_requests (
             .context("preparing review requests")?;
         let rows = stmt
             .query_map(params![limit as i64], |row| {
-                Ok(ReviewRequestItem {
+                Ok(SearchResultItem {
                     repo: row.get(0)?,
                     number: row.get(1)?,
                     title: row.get(2)?,
@@ -1285,6 +1302,67 @@ CREATE TABLE IF NOT EXISTS review_requests (
             .context("querying review requests")?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("reading review requests")
+    }
+
+    /// Replace one source's snapshot of the user's own pull requests or issues.
+    pub fn replace_my_items(&self, source: &str, items: &[SearchResultItem]) -> Result<()> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let tx = conn
+            .unchecked_transaction()
+            .context("starting my items replace")?;
+        tx.execute("DELETE FROM my_items WHERE source = ?1", params![source])
+            .context("clearing my items")?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT OR REPLACE INTO my_items
+                       (source, repo, number, title, author, html_url, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                )
+                .context("preparing my item insert")?;
+            for item in items {
+                stmt.execute(params![
+                    source,
+                    item.repo,
+                    item.number,
+                    item.title,
+                    item.author,
+                    item.html_url,
+                    item.created_at,
+                    item.updated_at,
+                ])
+                .context("inserting my item")?;
+            }
+        }
+        tx.commit().context("committing my items")
+    }
+
+    /// One source's items, most recently updated first.
+    pub fn list_my_items(&self, source: &str, limit: usize) -> Result<Vec<SearchResultItem>> {
+        let conn = self.conn.lock().expect("db lock poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT repo, number, title, author, html_url, created_at, updated_at
+                 FROM my_items
+                 WHERE source = ?1
+                 ORDER BY datetime(updated_at) DESC, number DESC LIMIT ?2",
+            )
+            .context("preparing my items")?;
+        let rows = stmt
+            .query_map(params![source, limit as i64], |row| {
+                Ok(SearchResultItem {
+                    repo: row.get(0)?,
+                    number: row.get(1)?,
+                    title: row.get(2)?,
+                    author: row.get(3)?,
+                    html_url: row.get(4)?,
+                    created_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            })
+            .context("querying my items")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("reading my items")
     }
 
     /// List repos that are watched or tracked by the workspace.
@@ -1728,6 +1806,7 @@ mod tests {
             "sync_state",
             "discussions",
             "review_requests",
+            "my_items",
             "dismissed_threads",
         ] {
             assert!(
@@ -2386,7 +2465,7 @@ mod tests {
     fn review_requests_are_replaced_and_ordered() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = Database::open(&dir.path().join("data.db")).expect("open");
-        let request = |number: i64, updated: &str| ReviewRequestItem {
+        let request = |number: i64, updated: &str| SearchResultItem {
             repo: "o/r".into(),
             number,
             title: format!("pr {number}"),
@@ -2436,6 +2515,46 @@ mod tests {
         assert!(!db
             .dismissed_thread_is_current("1:thread", "2026-01-01T00:00:00Z")
             .expect("record was cleared"));
+    }
+
+    #[test]
+    fn my_items_are_scoped_by_source_and_ordered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open(&dir.path().join("data.db")).expect("open");
+        let item = |number: i64, updated: &str| SearchResultItem {
+            repo: "o/r".into(),
+            number,
+            title: format!("item {number}"),
+            author: Some("me".into()),
+            html_url: format!("https://github.com/o/r/pull/{number}"),
+            created_at: Some("2026-08-01T00:00:00Z".into()),
+            updated_at: Some(updated.to_string()),
+        };
+        db.replace_my_items(
+            MY_PULL_REQUESTS,
+            &[
+                item(1, "2026-09-01T00:00:00Z"),
+                item(2, "2026-09-03T00:00:00Z"),
+            ],
+        )
+        .expect("prs");
+        db.replace_my_items(MY_ISSUES, &[item(3, "2026-09-02T00:00:00Z")])
+            .expect("issues");
+
+        let prs = db.list_my_items(MY_PULL_REQUESTS, 10).expect("prs");
+        assert_eq!(prs.iter().map(|i| i.number).collect::<Vec<_>>(), vec![2, 1]);
+        let issues = db.list_my_items(MY_ISSUES, 10).expect("issues");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].number, 3);
+
+        // Replacing one source leaves the other alone.
+        db.replace_my_items(MY_PULL_REQUESTS, &[item(4, "2026-09-04T00:00:00Z")])
+            .expect("replace prs");
+        assert_eq!(
+            db.list_my_items(MY_PULL_REQUESTS, 10).expect("prs").len(),
+            1
+        );
+        assert_eq!(db.list_my_items(MY_ISSUES, 10).expect("issues").len(), 1);
     }
 
     #[test]

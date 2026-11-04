@@ -14,8 +14,8 @@ threads — beyond what github.com/notifications supports.
   discussions bubble to the top. Nothing leaves the queue until it is
   closed/merged or you dismiss it.
 - **Summary dashboard**: at-a-glance direct mentions, CI failures, recent
-  project Discussions, and pull requests awaiting your review. Discussion
-  projects are configured in Settings &rarr; Discussions.
+  project Discussions, pull requests awaiting review, and your own open PRs
+  and issues. Discussion projects are configured in Settings &rarr; Discussions.
 - **Workspaces**: separate repo sets and filter sets (e.g. personal vs work).
 - **Unlimited saved filters**: org/repo include & exclude, state, type, age,
   unread, reason, and more.
